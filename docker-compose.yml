@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: server-stats-bot
+    restart: always
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - .:/app
+    working_dir: /app
