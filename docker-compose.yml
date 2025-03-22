@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   bot:
     build:
@@ -7,8 +5,13 @@ services:
       dockerfile: Dockerfile
     container_name: server-stats-bot
     restart: always
-    environment:
-      - BOT_TOKEN=${BOT_TOKEN}
+    env_file:
+      - .env
     volumes:
-      - .:/app
+      - ./pdf-storage:/app-pdfs
+      - ./logs:/app/logs
+      # Опционально: монтирование SSH-ключа, если используется
+      - ${SSH_KEY_PATH:-./ssh_key}:/app/ssh_key:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     working_dir: /app
