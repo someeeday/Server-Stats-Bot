@@ -10,8 +10,5 @@ services:
     volumes:
       - ./pdf-storage:/app-pdfs
       - ./logs:/app/logs
-      # Опционально: монтирование SSH-ключа, если используется
-      - ${SSH_KEY_PATH:-./ssh_key}:/app/ssh_key:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    working_dir: /app
