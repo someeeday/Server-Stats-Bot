@@ -7,6 +7,8 @@ services:
     restart: always
     env_file:
       - .env
+    environment: # Добавляем переменную окружения
+      COMPOSE_BAKE: "true"
     volumes:
       - ./pdf-storage:/app-pdfs
       - ./logs:/app/logs

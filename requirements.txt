@@ -2,4 +2,5 @@ aiogram==2.25.1
 psutil
 paramiko
 matplotlib
-reportlab
+reportlab>=3.6.0
+wmi

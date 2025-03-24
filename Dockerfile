@@ -6,7 +6,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     fontconfig \
     fonts-dejavu \
-    procps \
     locales \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -21,23 +20,23 @@ ENV LANG=ru_RU.UTF-8 \
     LANGUAGE=ru_RU:ru \
     LC_ALL=ru_RU.UTF-8
 
-# Копируем шрифт для использования в matplotlib и reportlab
+# Создаем директорию для шрифтов
 RUN mkdir -p /app/fonts
+
+# Копируем файлы проекта
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем шрифты
 COPY fonts/ /app/fonts/
 
 # Устанавливаем шрифты в систему
-RUN mkdir -p /usr/local/share/fonts && \
-    cp -r /app/fonts/*.ttf /usr/local/share/fonts/ || true && \
+RUN mkdir -p /usr/local/share/fonts/custom && \
+    cp -r /app/fonts/*.ttf /usr/local/share/fonts/custom/ || true && \
     fc-cache -fv
 
-# Настройка matplotlib для работы с кириллицей
-RUN mkdir -p /root/.config/matplotlib && \
-    echo "backend : Agg" > /root/.config/matplotlib/matplotlibrc && \
-    echo "font.family : sans-serif" >> /root/.config/matplotlib/matplotlibrc && \
-    echo "font.sans-serif : DejaVu Sans, Arial, Verdana" >> /root/.config/matplotlib/matplotlibrc
-
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+# Выводим список доступных шрифтов для отладки
+RUN fc-list | grep -i arial || true
 
 # Создание папок и установка прав
 RUN mkdir -p /app-pdfs && chmod -R 777 /app-pdfs
