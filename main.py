@@ -15,6 +15,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT  # type: ignore
 from reportlab.pdfbase import pdfmetrics  # type: ignore
 from reportlab.pdfbase.ttfonts import TTFont  # type: ignore
 import paramiko  # type: ignore
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # Пути к внешним папкам
 PDF_STORAGE_PATH = "/app-pdfs"
@@ -49,7 +50,7 @@ handler = RotatingFileHandler(
     encoding='utf-8'
 )
 handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    '%(asctime)s - %(name)s - %(levellevelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
 
@@ -440,10 +441,146 @@ def generate_system_report_pdf(system_data=None):
         logger.error(f"Ошибка при создании PDF: {e}", exc_info=True)  # Добавлено exc_info для стека ошибок
         return None
 
+# Добавляем словарь для хранения состояний пользователей
+user_states = {}
+
 @dp.message_handler(commands=["start"])
 async def start_command(message: types.Message):
     """Проверка работоспособности бота."""
-    await message.reply("Бот активен и готов к работе. Используйте /log для получения отчета.")
+    await message.answer(
+        "Бот активен и готов к работе.\n\n"
+        "Доступные команды:\n"
+        "/log - Получить отчет о системе\n"
+        "/ssh - Настроить SSH подключение (example: user@192.168.1.0)"
+    )
+
+@dp.message_handler(commands=["ssh"])
+async def ssh_command(message: types.Message):
+    """Запрос SSH данных у пользователя."""
+    if message.from_user.username != AUTHORIZED_USERNAME:
+        await message.answer("У вас нет доступа к этой команде.")
+        return
+    
+    # Проверяем существующее подключение
+    if all([os.getenv("SSH_HOSTNAME"), os.getenv("SSH_USERNAME"), os.getenv("SSH_PASSWORD")]):
+        # Создаем клавиатуру с кнопкой отмены
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Отменить", callback_data="cancel_ssh"))
+        
+        await message.answer(
+            f"У вас уже есть активное подключение к {os.getenv('SSH_USERNAME')}@{os.getenv('SSH_HOSTNAME')}\n"
+            "Для настройки нового подключения нажмите кнопку ниже.",
+            reply_markup=keyboard
+        )
+        return
+    
+    sent_msg = await message.answer("Введите SSH данные в формате user@host")
+    user_states[message.from_user.id] = {
+        "state": "waiting_ssh",
+        "message_id": sent_msg.message_id
+    }
+
+@dp.callback_query_handler(lambda c: c.data == 'cancel_ssh')
+async def cancel_ssh(callback_query: types.CallbackQuery):
+    """Обработка отмены существующего SSH подключения."""
+    try:
+        # Очищаем переменные окружения
+        for key in ["SSH_HOSTNAME", "SSH_USERNAME", "SSH_PASSWORD"]:
+            if key in os.environ:
+                del os.environ[key]
+        
+        # Удаляем сообщение с кнопкой
+        await callback_query.message.delete()
+        
+        # Отправляем новое сообщение для ввода данных
+        sent_msg = await callback_query.message.answer("Введите SSH данные в формате user@host")
+        user_states[callback_query.from_user.id] = {
+            "state": "waiting_ssh",
+            "message_id": sent_msg.message_id
+        }
+        
+        # Отвечаем на callback
+        await callback_query.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отмене SSH подключения: {e}")
+        await callback_query.message.answer("Произошла ошибка при отмене подключения")
+
+@dp.message_handler(lambda message: isinstance(user_states.get(message.from_user.id), dict) and 
+                   user_states.get(message.from_user.id, {}).get("state") == "waiting_ssh")
+async def process_ssh_input(message: types.Message):
+    """Обработка введенных SSH данных."""
+    try:
+        if '@' not in message.text:
+            await message.answer("Неверный формат. Используйте формат: user@host")
+            return
+
+        # Получаем сохраненное сообщение бота
+        orig_message_id = user_states[message.from_user.id]["message_id"]
+        username, hostname = message.text.split('@')
+        
+        # Обновляем состояние пользователя
+        user_states[message.from_user.id].update({
+            "state": "waiting_password",
+            "username": username,
+            "hostname": hostname
+        })
+        
+        # Удаляем сообщение пользователя
+        await message.delete()
+        
+        # Обновляем оригинальное сообщение бота
+        await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=orig_message_id,
+            text=f"Введите пароль для {username}@{hostname}:"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при обработке SSH данных: {e}")
+        await message.answer("Произошла ошибка при обработке данных")
+        user_states.pop(message.from_user.id, None)
+
+@dp.message_handler(lambda message: isinstance(user_states.get(message.from_user.id), dict) and 
+                   user_states.get(message.from_user.id, {}).get("state") == "waiting_password")
+async def process_password(message: types.Message):
+    """Обработка введенного пароля и проверка подключения."""
+    try:
+        user_data = user_states[message.from_user.id]
+        username = user_data["username"]
+        hostname = user_data["hostname"]
+        password = message.text
+
+        # Удаляем сообщение с паролем для безопасности
+        await message.delete()
+
+        # Пробуем подключиться
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        try:
+            ssh_client.connect(
+                hostname=hostname,
+                username=username,
+                password=password,
+                timeout=10
+            )
+            ssh_client.close()
+            
+            # Сохраняем данные в переменные окружения
+            os.environ["SSH_HOSTNAME"] = hostname
+            os.environ["SSH_USERNAME"] = username
+            os.environ["SSH_PASSWORD"] = password
+            
+            await message.answer("✅ SSH соединение настроено!")
+        except Exception as ssh_error:
+            logger.error(f"Ошибка SSH подключения: {ssh_error}")
+            await message.answer("❌ Ошибка подключения. Проверьте данные и попробуйте снова.")
+    except Exception as e:
+        logger.error(f"Ошибка при обработке пароля: {e}")
+        await message.answer("Произошла ошибка при обработке данных")
+    finally:
+        # Очищаем состояние пользователя
+        user_states.pop(message.from_user.id, None)
 
 @dp.message_handler(commands=["log"])
 async def log_command(message: types.Message):
@@ -451,12 +588,12 @@ async def log_command(message: types.Message):
     try:
         # Проверка авторизации
         if message.from_user.username != AUTHORIZED_USERNAME:
-            await message.reply("У вас нет доступа к этой команде.")
+            await message.answer("У вас нет доступа к этой команде.")
             logger.warning(f"Попытка доступа от неавторизованного пользователя: {message.from_user.username}")
             return
 
         # Отправка уведомления
-        wait_message = await message.reply("Генерирую отчет о системе...")
+        wait_message = await message.answer("Генерирую отчет о системе...")
 
         # Параметры для подключения по SSH
         ssh_hostname = os.getenv("SSH_HOSTNAME")
@@ -482,7 +619,7 @@ async def log_command(message: types.Message):
             await wait_message.edit_text("Не удалось создать отчет. Проверьте логи.")
             logger.error("Не удалось создать отчет. Проверьте логи.")
     except Exception as e:
-        await message.reply("Произошла ошибка при выполнении команды. Проверьте логи.")
+        await message.answer("Произошла ошибка при выполнении команды. Проверьте логи.")
         logger.error(f"Ошибка при выполнении команды /log: {e}", exc_info=True)
 
 if __name__ == "__main__":
