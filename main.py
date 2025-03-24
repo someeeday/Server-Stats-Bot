@@ -11,6 +11,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle # type: ign
 from reportlab.lib.enums import TA_CENTER, TA_LEFT # type: ignore
 from reportlab.pdfbase import pdfmetrics # type: ignore
 from reportlab.pdfbase.ttfonts import TTFont # type: ignore
+import paramiko # type: ignore
 
 # Пути к внешним папкам
 PDF_STORAGE_PATH = "/app-pdfs"
@@ -20,7 +21,7 @@ FONTS_PATH = "./fonts"
 # Настройки
 MAX_FILES = 10
 DEFAULT_FONT = 'DejaVuSans'
-AUTHORIZED_USERNAME = 'someeeday'
+AUTHORIZED_USERNAME = 'someeeday' # Replace with the actual authorized username
 
 # Создание необходимых папок
 for path in [LOGS_PATH, PDF_STORAGE_PATH]:
@@ -81,8 +82,73 @@ def cleanup_old_pdfs():
     except Exception as e:
         logger.error(f"Ошибка при очистке старых файлов: {e}")
 
-def generate_system_report_pdf():
-    """Генерирует PDF-отчет с пустыми данными и графиками."""
+def execute_ssh_command(ssh_client, command, timeout=10):
+    """Выполняет SSH-команду и возвращает результат."""
+    try:
+        _, stdout, _ = ssh_client.exec_command(command, timeout=timeout)
+        return stdout.read().decode().strip()
+    except Exception as e:
+        logger.error(f"Ошибка выполнения команды '{command}': {e}", exc_info=True)
+        return "Неизвестно"
+
+def get_linux_system_info(ssh_client):
+    """Собирает информацию о системе Linux."""
+    try:
+        return {
+            'Пользователь': execute_ssh_command(ssh_client, 'whoami'),
+            'Хост': execute_ssh_command(ssh_client, 'hostname'),
+            'Операционная система': execute_ssh_command(ssh_client, "grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"'"),
+            'Версия ОС': execute_ssh_command(ssh_client, 'uname -r'),
+            'Процессор': execute_ssh_command(ssh_client, "grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs"),
+            'Количество ядер': execute_ssh_command(ssh_client, 'nproc'),
+            'Оперативная память': execute_ssh_command(ssh_client, "free -h | awk '/^Mem:/ {print $2}'"),
+            'Объем диска': execute_ssh_command(ssh_client, "df -h / | awk 'NR==2 {print $2}'"),
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при сборе информации о Linux: {e}", exc_info=True)
+        return {}
+
+def get_windows_system_info(ssh_client):
+    """Собирает информацию о системе Windows."""
+    try:
+        return {
+            'Пользователь': execute_ssh_command(ssh_client, 'powershell.exe -command "$env:USERNAME"'),
+            'Хост': execute_ssh_command(ssh_client, 'powershell.exe -command "$env:COMPUTERNAME"'),
+            'Операционная система': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_OperatingSystem).Caption"'),
+            'Версия ОС': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_OperatingSystem).Version"'),
+            'Процессор': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_Processor).Name"'),
+            'Количество ядер': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_ComputerSystem).NumberOfProcessors"'),
+            'Оперативная память': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_ComputerSystem).TotalPhysicalMemory | ForEach-Object { [Math]::Round($_ / 1MB, 0) }"') + " MB",
+            'Объем диска': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_DiskDrive | Select-Object Size | ForEach-Object { [Math]::Round($_.Size / 1GB, 0) })[0]"') + " GB",
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при сборе информации о Windows: {e}", exc_info=True)
+        return {}
+
+def determine_os_type(ssh_client):
+    """Определяет тип операционной системы (Linux или Windows)."""
+    output = execute_ssh_command(ssh_client, 'ver')
+    return "windows" if "windows" in output.lower() else "linux"
+
+def get_system_info_ssh(hostname, port, username, password):
+    """Подключается к удаленной системе по SSH и собирает информацию."""
+    try:
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(hostname=hostname, port=port, username=username, password=password, timeout=30)
+
+        os_type = determine_os_type(ssh_client)
+        system_data = get_linux_system_info(ssh_client) if os_type == "linux" else get_windows_system_info(ssh_client)
+        system_data.update({'IP-адрес': hostname, 'Порт SSH': port})
+
+        ssh_client.close()
+        return system_data
+    except Exception as e:
+        logger.error(f"Ошибка при подключении по SSH или сборе информации: {e}", exc_info=True)
+        return {}
+
+def generate_system_report_pdf(system_data=None):
+    """Генерирует PDF-отчет с данными о системе."""
     try:
         # Получение времени в Москве
         moscow_tz = timezone(timedelta(hours=3))  # UTC+3
@@ -141,21 +207,34 @@ def generate_system_report_pdf():
         # Основная информация о системе
         elements.append(Paragraph("Основная информация", heading_style))
         
-        # Создаем таблицу с пустыми данными
-        system_data = [
-            ["Параметр", "Значение"],
-            ["Пользователь", "—"],
-            ["Хост", "—"],
-            ["Операционная система", "—"],
-            ["Версия ОС", "—"],
-            ["Процессор", "—"],
-            ["Количество ядер", "—"],
-            ["Оперативная память", "—"],
-            ["Объем диска", "—"]
-        ]
+        # Создаем таблицу с данными
+        if system_data:
+            system_data_list = [
+                ["Параметр", "Значение"],
+                ["Пользователь", system_data.get('Пользователь', '—')],
+                ["IP-адрес", system_data.get('IP-адрес', '—')],
+                ["Порт SSH", system_data.get('Порт SSH', '—')],
+                ["Операционная система", system_data.get('Операционная система', '—')],
+                ["Версия ОС", system_data.get('Версия ОС', '—')],
+                ["Процессор", system_data.get('Процессор', '—')],
+                ["Оперативная память", system_data.get('Оперативная память', '—')],
+                ["Объем диска", system_data.get('Объем диска', '—')]
+            ]
+        else:
+            system_data_list = [
+                ["Параметр", "Значение"],
+                ["Пользователь", "—"],
+                ["IP-адрес", "—"],
+                ["Порт SSH", "—"],
+                ["Операционная система", "—"],
+                ["Версия ОС", "—"],
+                ["Процессор", "—"],
+                ["Оперативная память", "—"],
+                ["Объем диска", "—"]
+            ]
         
         # Создание таблицы
-        t = Table(system_data, colWidths=[2.5*inch, 4*inch])
+        t = Table(system_data_list, colWidths=[2.5*inch, 4*inch])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
@@ -211,8 +290,22 @@ async def log_command(message: types.Message):
         # Отправка уведомления
         wait_message = await message.reply("Генерирую отчет о системе...")
 
+        # Параметры для подключения по SSH
+        ssh_hostname = os.getenv("SSH_HOSTNAME")
+        ssh_port = int(os.getenv("SSH_PORT", 22))
+        ssh_username = os.getenv("SSH_USERNAME")
+        ssh_password = os.getenv("SSH_PASSWORD")
+
+        if not all([ssh_hostname, ssh_username, ssh_password]):
+            await wait_message.edit_text("Необходимо задать параметры SSH в переменных окружения.")
+            logger.error("Необходимо задать параметры SSH в переменных окружения.")
+            return
+
+        # Получение данных о системе через SSH
+        system_data = get_system_info_ssh(ssh_hostname, ssh_port, ssh_username, ssh_password)
+
         # Создание и отправка отчета
-        pdf_file = generate_system_report_pdf()
+        pdf_file = generate_system_report_pdf(system_data)
         if pdf_file and os.path.exists(pdf_file):
             with open(pdf_file, "rb") as file:
                 await message.answer_document(file, caption="Отчет о системе")
