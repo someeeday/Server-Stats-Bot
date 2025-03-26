@@ -1,13 +1,15 @@
 import asyncio
 from datetime import datetime, timedelta
 import logging
-import paramiko
+import paramiko # type: ignore
 from typing import Dict, Any
 import time
+import json
+from main import logger  # Используем logger из main
 
 # Пороговые значения для оповещений
 THRESHOLDS = {
-    'cpu': 80,  # CPU usage above 80%
+    'cpu': 90,  # CPU usage above 80%
     'ram': 90,  # RAM usage above 85%
     'disk': 90  # Disk usage above 90%
 }
@@ -93,6 +95,18 @@ class MetricsCache:
         self.cache[user_id] = data
         self.last_update[user_id] = time.time()
 
+def format_size(size: float, unit: str) -> str:
+    """Форматирует размер в читаемый вид"""
+    if unit.upper() == 'MB':
+        if size > 1024:
+            return f"{size/1024:.1f} GB"
+        return f"{size:.0f} MB"
+    elif unit.upper() == 'GB':
+        if size > 1024:
+            return f"{size/1024:.1f} TB"
+        return f"{size:.1f} GB"
+    return f"{size} {unit}"
+
 class SystemMonitor:
     def __init__(self, bot, check_interval=300):  # 300 секунд = 5 минут
         self.bot = bot
@@ -101,20 +115,24 @@ class SystemMonitor:
         self.logger = logging.getLogger("server-stats-bot.monitor")
         self.ssh_pool = SSHPool()
         self.metrics_cache = MetricsCache()
+        self.alert_states = {}  # Словарь для хранения состояний алертов
         
-        # Оптимизированные команды для Linux
+        # Оптимизированные легкие команды для Linux
         self.linux_commands = {
-            'cpu': "top -bn1 | grep 'Cpu(s)' | awk '{print int($2)}'",
-            'ram': "free | grep Mem | awk '{print int($3/$2 * 100)}'",
-            'disk': "df / | tail -1 | awk '{print int($5)}'"
+            'cpu': "cat /proc/stat | head -n1 | awk '{print ($2+$4)*100/($2+$4+$5)}'",  # Более легкий способ
+            'ram': "free | awk '/Mem:/ {print int($3/$2 * 100)}'",  # Прямой расчет без промежуточных команд
+            'disk': "df -P / | tail -1 | awk '{print int($5)}'"  # Убираем grep и лишние операции
         }
         
-        # Оптимизированные команды для Windows
+        # Оптимизированные легкие команды для Windows
         self.windows_commands = {
-            'cpu': 'powershell -command "$cpu=(Get-Counter \'\Processor(_Total)\% Processor Time\').CounterSamples.CookedValue;Write-Output ([Math]::Round($cpu))"',
-            'ram': 'powershell -command "$os=Get-WmiObject Win32_OperatingSystem;$used=$os.TotalVisibleMemorySize-$os.FreePhysicalMemory;Write-Output ([Math]::Round($used/$os.TotalVisibleMemorySize*100))"',
-            'disk': 'powershell -command "$disk=Get-PSDrive C;Write-Output ([Math]::Round($disk.Used/($disk.Used+$disk.Free)*100))"'
+            'cpu': 'powershell -command "$cpu=Get-CimInstance Win32_Processor;$cpu.LoadPercentage"',  # Более легкий способ
+            'ram': 'powershell -command "Get-CimInstance Win32_OperatingSystem | % {[math]::Round(100-($_.FreePhysicalMemory/$_.TotalVisibleMemorySize*100))}"',
+            'disk': 'powershell -command "Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID=\'C:\'\" | % {[math]::Round(100-($_.FreeSpace/$_.Size*100))}"'
         }
+        self.last_alert_time = {}  # Добавляем отслеживание времени последнего алерта
+        # Добавляем порт для агента
+        self.agent_port = 8080
 
     async def start_monitoring(self, user_id, ssh_data):
         """Запускает мониторинг для конкретного пользователя"""
@@ -140,6 +158,9 @@ class SystemMonitor:
         if user_id in self.monitoring_tasks:
             self.monitoring_tasks[user_id].cancel()
             del self.monitoring_tasks[user_id]
+            # Очищаем состояния алертов при остановке мониторинга
+            if user_id in self.alert_states:
+                del self.alert_states[user_id]
             self.logger.info(f"Остановлен мониторинг для пользователя {user_id}")
             return True
         return False
@@ -181,26 +202,65 @@ class SystemMonitor:
         try:
             ssh = self.ssh_pool.get_connection(user_id, ssh_data)
             
-            # Определяем ОС и выбираем команды
+            # Пробуем получить метрики от агента через SSH туннель
+            try:
+                # Создаем SSH туннель до агента
+                ssh.get_transport().request_port_forward('', self.agent_port, 'localhost', self.agent_port)
+                
+                # Выполняем запрос к агенту через туннель
+                _, stdout, _ = ssh.exec_command(f'curl -s http://localhost:{self.agent_port}/metrics', timeout=5)
+                metrics_data = stdout.read().decode().strip()
+                metrics = json.loads(metrics_data)
+                
+                # Кэшируем результат
+                self.metrics_cache.set(user_id, metrics)
+                return metrics
+                
+            except Exception as agent_error:
+                logger.warning(f"Не удалось получить метрики от агента: {agent_error}. Используем старый метод.")
+                # Если агент недоступен, используем старый метод
+                return await self._get_metrics_legacy(ssh)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении метрик: {e}")
+            return {'cpu': 0, 'ram': 0, 'disk': 0}
+
+    async def _get_metrics_legacy(self, ssh):
+        """Оптимизированный метод получения метрик"""
+        try:
             os_type = "windows" if self._is_windows(ssh) else "linux"
             commands = self.windows_commands if os_type == "windows" else self.linux_commands
             
-            # Выполняем все команды сразу
             metrics = {}
-            for metric, cmd in commands.items():
-                try:
-                    _, stdout, _ = ssh.exec_command(cmd, timeout=5)
-                    value = float(stdout.read().decode().strip())
-                    metrics[metric] = value
-                except:
-                    metrics[metric] = 0
+            # Выполняем команды одновременно через ; для оптимизации
+            combined_cmd = " ; ".join(f"echo '{k}='$({v})" for k, v in commands.items())
             
-            # Кэшируем результат
-            self.metrics_cache.set(user_id, metrics)
+            _, stdout, _ = ssh.exec_command(combined_cmd, timeout=5)
+            output = stdout.read().decode().strip()
+            
+            for line in output.split('\n'):
+                if '=' in line:
+                    key, value = line.strip().split('=')
+                    try:
+                        if '|' in value:  # Для RAM и Disk
+                            used, total = map(float, value.split('|'))
+                            if key == 'ram':
+                                metrics[f'{key}_used'] = format_size(used, 'MB')
+                                metrics[f'{key}_total'] = format_size(total, 'MB')
+                                metrics[key] = round(used / total * 100, 1)
+                            else:  # disk
+                                metrics[f'{key}_used'] = format_size(used, 'GB')
+                                metrics[f'{key}_total'] = format_size(total, 'GB')
+                                metrics[key] = round(used / total * 100, 1)
+                        else:  # Для CPU
+                            metrics[key] = float(value)
+                    except ValueError:
+                        metrics[key] = 0
+            
             return metrics
             
         except Exception as e:
-            self.logger.error(f"Ошибка при получении метрик: {e}")
+            logger.error(f"Ошибка при получении метрик: {e}")
             return {'cpu': 0, 'ram': 0, 'disk': 0}
 
     def _is_windows(self, ssh: paramiko.SSHClient) -> bool:
@@ -211,26 +271,55 @@ class SystemMonitor:
             return False
 
     async def _check_thresholds(self, user_id: int, metrics: dict):
-        alerts = []
+        """Оптимизированная проверка метрик"""
+        current_time = time.time()
+        min_alert_interval = 3600  # 1 час между алертами
         
-        for resource, value in metrics.items():
-            if value >= THRESHOLDS[resource]:
-                alerts.append((resource, value))
-                
-        if alerts:
+        if user_id not in self.alert_states:
+            self.alert_states[user_id] = {k: False for k in THRESHOLDS.keys()}
+            self.last_alert_time[user_id] = {k: 0 for k in THRESHOLDS.keys()}
+
+        alerts_to_send = []
+        resolved_alerts = []
+
+        for resource in THRESHOLDS.keys():
+            current_value = metrics.get(resource, 0)
+            is_critical = current_value >= THRESHOLDS[resource]
+            prev_state = self.alert_states[user_id][resource]
+            last_alert = self.last_alert_time[user_id][resource]
+
+            if is_critical and (not prev_state or current_time - last_alert >= min_alert_interval):
+                details = []
+                if resource in ['ram', 'disk']:
+                    used = metrics.get(f'{resource}_used', 'N/A')
+                    total = metrics.get(f'{resource}_total', 'N/A')
+                    details.append(f"Использовано: {used} из {total}")
+                alerts_to_send.append((resource, current_value, details))
+                self.last_alert_time[user_id][resource] = current_time
+            elif not is_critical and prev_state:
+                resolved_alerts.append(resource)
+
+            self.alert_states[user_id][resource] = is_critical
+
+        # Отправляем уведомления только если есть что отправлять
+        if alerts_to_send:
             message = "⚠️ *Критические показатели:*\n\n"
-            for resource, value in alerts:
+            for resource, value, details in alerts_to_send:
                 message += f"*{self._get_resource_name(resource)}:* {value:.1f}%\n"
+                for detail in details:
+                    message += f"{detail}\n"
                 message += "*Рекомендации:*\n"
                 for rec in RECOMMENDATIONS[resource]:
                     message += f"{rec}\n"
                 message += "\n"
-                
-            await self.bot.send_message(
-                user_id,
-                message,
-                parse_mode="Markdown"
-            )
+            
+            await self.bot.send_message(user_id, message, parse_mode="Markdown")
+
+        if resolved_alerts:
+            message = "✅ *Показатели пришли в норму:*\n\n"
+            for resource in resolved_alerts:
+                message += f"*{self._get_resource_name(resource)}*\n"
+            await self.bot.send_message(user_id, message, parse_mode="Markdown")
 
     async def _check_metrics(self, user_id, system_data):
         """Проверяет метрики и отправляет уведомления при необходимости"""
