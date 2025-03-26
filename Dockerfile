@@ -39,7 +39,8 @@ ENV LANG=ru_RU.UTF-8 \
     LANGUAGE=ru_RU:ru \
     LC_ALL=ru_RU.UTF-8 \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLCONFIGDIR=/tmp/matplotlib
 
 # Копирование установленных пакетов из этапа сборки
 COPY --from=builder /root/.local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
@@ -48,10 +49,10 @@ COPY --from=builder /root/.local/lib/python3.10/site-packages /usr/local/lib/pyt
 RUN useradd -m -r -s /bin/bash botuser
 
 # Создание и настройка директорий с правильными правами
-RUN mkdir -p /app/fonts /app/logs /app-pdfs \
-    && chown -R botuser:botuser /app /app-pdfs \
+RUN mkdir -p /app/fonts /app/logs /app-pdfs /tmp/matplotlib \
+    && chown -R botuser:botuser /app /app-pdfs /tmp/matplotlib \
     && chmod -R 755 /app \
-    && chmod -R 777 /app/logs /app-pdfs
+    && chmod -R 777 /app/logs /app-pdfs /tmp/matplotlib
 
 # Копирование шрифтов и обновление кэша
 COPY fonts/ /app/fonts/
