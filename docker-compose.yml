@@ -7,8 +7,9 @@ services:
     restart: always
     env_file:
       - .env
-    environment: # Добавляем переменную окружения
-      COMPOSE_BAKE: "true"
+    environment:
+      DOCKER_BUILDKIT: 1
+      COMPOSE_DOCKER_CLI_BUILD: 1
     volumes:
       - ./pdf-storage:/app-pdfs
       - ./logs:/app/logs

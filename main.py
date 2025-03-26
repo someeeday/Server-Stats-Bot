@@ -15,7 +15,8 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT  # type: ignore
 from reportlab.pdfbase import pdfmetrics  # type: ignore
 from reportlab.pdfbase.ttfonts import TTFont  # type: ignore
 import paramiko  # type: ignore
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton # type: ignore
+from monitoring import SystemMonitor  # Добавляем импорт
 
 # Пути к внешним папкам
 PDF_STORAGE_PATH = "/app-pdfs"
@@ -25,7 +26,6 @@ FONTS_PATH = "./fonts"
 # Настройки
 MAX_FILES = 10
 DEFAULT_FONT = 'DejaVuSans'
-AUTHORIZED_USERNAME = 'someeeday' # Replace with the actual authorized username
 
 # Создание необходимых папок
 for path in [LOGS_PATH, PDF_STORAGE_PATH]:
@@ -50,7 +50,7 @@ handler = RotatingFileHandler(
     encoding='utf-8'
 )
 handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(name)s - %(levellevelname)s - %(message)s',
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
 
@@ -84,6 +84,8 @@ if not TOKEN:
 # Инициализация бота
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
+
+monitor = SystemMonitor(bot)
 
 def cleanup_old_pdfs():
     """Удаляет старые файлы, оставляя только последние MAX_FILES."""
@@ -444,31 +446,101 @@ def generate_system_report_pdf(system_data=None):
 # Добавляем словарь для хранения состояний пользователей
 user_states = {}
 
+# Глобальный словарь для хранения SSH данных вместо env
+ssh_connections = {}
+
+# Добавляем ограничения безопасности
+BLOCKED_HOSTS = {
+    'localhost', '127.0.0.1', '::1',  # локалхост
+    '0.0.0.0', '0.0.0.0/0',          # все интерфейсы
+    '10.0.0.0/8',                     # private network
+    '172.16.0.0/12',                  # private network
+    '192.168.0.0/16',                 # private network
+    'fc00::/7'                        # unique local addresses
+}
+
+MAX_FAILED_ATTEMPTS = 3
+LOCKOUT_TIME = 300  # 5 минут
+failed_attempts = {}
+locked_users = {}
+
+def is_host_allowed(hostname):
+    """Проверяет, разрешен ли хост для подключения."""
+    try:
+        # Проверяем формат IP
+        if not hostname or not isinstance(hostname, str):
+            return False
+            
+        # Проверяем на наличие shell инъекций
+        if any(char in hostname for char in ';&|`$(){}[]<>\\'):
+            return False
+            
+        # Проверяем на локальные адреса
+        for blocked in BLOCKED_HOSTS:
+            if '/' in blocked:  # это CIDR
+                continue  # пропускаем сложные проверки CIDR
+            elif blocked in hostname:
+                return False
+                
+        return True
+    except Exception:
+        return False
+
+def check_rate_limit(user_id):
+    """Проверяет ограничение попыток подключения."""
+    current_time = datetime.now()
+    
+    # Проверяем блокировку
+    if user_id in locked_users:
+        if (current_time - locked_users[user_id]).total_seconds() < LOCKOUT_TIME:
+            return False
+        del locked_users[user_id]
+        failed_attempts[user_id] = 0
+        
+    return True
+
+def record_failed_attempt(user_id):
+    """Записывает неудачную попытку подключения."""
+    if user_id not in failed_attempts:
+        failed_attempts[user_id] = 1
+    else:
+        failed_attempts[user_id] += 1
+        
+    if failed_attempts[user_id] >= MAX_FAILED_ATTEMPTS:
+        locked_users[user_id] = datetime.now()
+
 @dp.message_handler(commands=["start"])
 async def start_command(message: types.Message):
-    """Проверка работоспособности бота."""
+    """Начальное приветствие и список команд."""
     await message.answer(
         "Бот активен и готов к работе.\n\n"
         "Доступные команды:\n"
         "/log - Получить отчет о системе\n"
-        "/ssh - Настроить SSH подключение (example: user@192.168.1.0)"
+        "/ssh - Настроить SSH подключение\n"
+        "/start_monitor - Включить мониторинг системы\n"
+        "/stop_monitor - Выключить мониторинг системы"
     )
 
 @dp.message_handler(commands=["ssh"])
 async def ssh_command(message: types.Message):
     """Запрос SSH данных у пользователя."""
-    if message.from_user.username != AUTHORIZED_USERNAME:
-        await message.answer("У вас нет доступа к этой команде.")
+    user_id = message.from_user.id
+    
+    # Проверяем ограничение попыток
+    if not check_rate_limit(user_id):
+        remaining_time = int((LOCKOUT_TIME - (datetime.now() - locked_users[user_id]).total_seconds()) / 60)
+        await message.answer(f"Слишком много неудачных попыток. Попробуйте через {remaining_time} минут.")
         return
     
     # Проверяем существующее подключение
-    if all([os.getenv("SSH_HOSTNAME"), os.getenv("SSH_USERNAME"), os.getenv("SSH_PASSWORD")]):
+    if message.from_user.id in ssh_connections:
         # Создаем клавиатуру с кнопкой отмены
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton("Отменить", callback_data="cancel_ssh"))
         
+        conn = ssh_connections[message.from_user.id]
         await message.answer(
-            f"У вас уже есть активное подключение к {os.getenv('SSH_USERNAME')}@{os.getenv('SSH_HOSTNAME')}\n"
+            f"У вас уже есть активное подключение к {conn['username']}@{conn['hostname']}\n"
             "Для настройки нового подключения нажмите кнопку ниже.",
             reply_markup=keyboard
         )
@@ -484,10 +556,9 @@ async def ssh_command(message: types.Message):
 async def cancel_ssh(callback_query: types.CallbackQuery):
     """Обработка отмены существующего SSH подключения."""
     try:
-        # Очищаем переменные окружения
-        for key in ["SSH_HOSTNAME", "SSH_USERNAME", "SSH_PASSWORD"]:
-            if key in os.environ:
-                del os.environ[key]
+        # Удаляем сохраненное подключение
+        if callback_query.from_user.id in ssh_connections:
+            del ssh_connections[callback_query.from_user.id]
         
         # Удаляем сообщение с кнопкой
         await callback_query.message.delete()
@@ -515,9 +586,15 @@ async def process_ssh_input(message: types.Message):
             await message.answer("Неверный формат. Используйте формат: user@host")
             return
 
+        username, hostname = message.text.split('@')
+        
+        # Проверяем безопасность хоста
+        if not is_host_allowed(hostname):
+            await message.answer("⚠️ Подключение к этому хосту запрещено по соображениям безопасности.")
+            return
+
         # Получаем сохраненное сообщение бота
         orig_message_id = user_states[message.from_user.id]["message_id"]
-        username, hostname = message.text.split('@')
         
         # Обновляем состояние пользователя
         user_states[message.from_user.id].update({
@@ -540,7 +617,7 @@ async def process_ssh_input(message: types.Message):
         await message.answer("Произошла ошибка при обработке данных")
         user_states.pop(message.from_user.id, None)
 
-@dp.message_handler(lambda message: isinstance(user_states.get(message.from_user.id), dict) and 
+@dp.message_handler(lambda message: isinstance(user_states.get(message.from_user.id), dict) and
                    user_states.get(message.from_user.id, {}).get("state") == "waiting_password")
 async def process_password(message: types.Message):
     """Обработка введенного пароля и проверка подключения."""
@@ -566,13 +643,21 @@ async def process_password(message: types.Message):
             )
             ssh_client.close()
             
-            # Сохраняем данные в переменные окружения
-            os.environ["SSH_HOSTNAME"] = hostname
-            os.environ["SSH_USERNAME"] = username
-            os.environ["SSH_PASSWORD"] = password
+            # Сбрасываем счетчик неудачных попыток
+            failed_attempts[message.from_user.id] = 0
+            
+            # Сохраняем данные в словарь подключений
+            ssh_connections[message.from_user.id] = {
+                "hostname": hostname,
+                "username": username,
+                "password": password,
+                "port": 22  # Можно добавить настройку порта позже
+            }
             
             await message.answer("✅ SSH соединение настроено!")
         except Exception as ssh_error:
+            # Записываем неудачную попытку
+            record_failed_attempt(message.from_user.id)
             logger.error(f"Ошибка SSH подключения: {ssh_error}")
             await message.answer("❌ Ошибка подключения. Проверьте данные и попробуйте снова.")
     except Exception as e:
@@ -586,28 +671,24 @@ async def process_password(message: types.Message):
 async def log_command(message: types.Message):
     """Генерация и отправка отчета о системе."""
     try:
-        # Проверка авторизации
-        if message.from_user.username != AUTHORIZED_USERNAME:
-            await message.answer("У вас нет доступа к этой команде.")
-            logger.warning(f"Попытка доступа от неавторизованного пользователя: {message.from_user.username}")
+        # Проверяем наличие сохраненного подключения
+        if message.from_user.id not in ssh_connections:
+            await message.answer("❌ Ошибка: SSH соединение не настроено. Используйте команду /ssh для настройки подключения.")
             return
 
         # Отправка уведомления
         wait_message = await message.answer("Генерирую отчет о системе...")
 
-        # Параметры для подключения по SSH
-        ssh_hostname = os.getenv("SSH_HOSTNAME")
-        ssh_port = int(os.getenv("SSH_PORT", 22))
-        ssh_username = os.getenv("SSH_USERNAME")
-        ssh_password = os.getenv("SSH_PASSWORD")
-
-        if not all([ssh_hostname, ssh_username, ssh_password]):
-            await wait_message.edit_text("Необходимо задать параметры SSH в переменных окружения.")
-            logger.error("Необходимо задать параметры SSH в переменных окружения.")
-            return
-
+        # Получаем сохраненные параметры подключения
+        conn = ssh_connections[message.from_user.id]
+        
         # Получение данных о системе через SSH
-        system_data = get_system_info_ssh(ssh_hostname, ssh_port, ssh_username, ssh_password)
+        system_data = get_system_info_ssh(
+            conn["hostname"],
+            conn.get("port", 22),
+            conn["username"],
+            conn["password"]
+        )
 
         # Создание и отправка отчета
         pdf_file = generate_system_report_pdf(system_data)
@@ -618,9 +699,78 @@ async def log_command(message: types.Message):
         else:
             await wait_message.edit_text("Не удалось создать отчет. Проверьте логи.")
             logger.error("Не удалось создать отчет. Проверьте логи.")
+        
+        if not monitor.is_monitoring(message.from_user.id):
+            keyboard = InlineKeyboardMarkup()
+            keyboard.row(
+                InlineKeyboardButton("✅ Да", callback_data="monitor_start"),
+                InlineKeyboardButton("❌ Нет", callback_data="monitor_cancel")
+            )
+            await message.answer(
+                "📊 Хотите включить постоянный мониторинг системы?\n\n"
+                "Я буду следить за состоянием системы и уведомлять вас "
+                "о критических ситуациях с рекомендациями по их устранению.",
+                reply_markup=keyboard
+            )
     except Exception as e:
         await message.answer("Произошла ошибка при выполнении команды. Проверьте логи.")
         logger.error(f"Ошибка при выполнении команды /log: {e}", exc_info=True)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('monitor_'))
+async def process_monitor_callback(callback_query: types.CallbackQuery):
+    """Обработка ответа на предложение мониторинга"""
+    user_id = callback_query.from_user.id
+    
+    if callback_query.data == "monitor_start":
+        if user_id in ssh_connections:
+            started = await monitor.start_monitoring(user_id, ssh_connections[user_id])
+            if started:
+                await callback_query.message.edit_text(
+                    "✅ Мониторинг системы включен!\n\n"
+                    "Вы будете получать уведомления о критических ситуациях.\n"
+                    "Для отключения мониторинга используйте команду /stop_monitor"
+                )
+            else:
+                await callback_query.message.edit_text(
+                    "❗ Мониторинг уже запущен"
+                )
+        else:
+            await callback_query.message.edit_text(
+                "❌ Ошибка: SSH соединение не настроено.\n"
+                "Используйте команду /ssh для настройки подключения."
+            )
+    else:  # monitor_cancel
+        await callback_query.message.edit_text(
+            "👌 Хорошо, мониторинг не будет включен.\n"
+            "Вы всегда можете включить его позже командой /start_monitor"
+        )
+
+@dp.message_handler(commands=["start_monitor"])
+async def start_monitor_command(message: types.Message):
+    """Команда для включения мониторинга"""
+    user_id = message.from_user.id
+    if user_id in ssh_connections:
+        if await monitor.start_monitoring(user_id, ssh_connections[user_id]):
+            await message.answer(
+                "✅ Мониторинг системы включен!\n\n"
+                "Вы будете получать уведомления о критических ситуациях.\n"
+                "Для отключения мониторинга используйте команду /stop_monitor"
+            )
+        else:
+            await message.answer("❗ Мониторинг уже запущен")
+    else:
+        await message.answer(
+            "❌ Ошибка: SSH соединение не настроено.\n"
+            "Используйте команду /ssh для настройки подключения."
+        )
+
+@dp.message_handler(commands=["stop_monitor"])
+async def stop_monitor_command(message: types.Message):
+    """Команда для выключения мониторинга"""
+    if await monitor.stop_monitoring(message.from_user.id):
+        await message.answer("✅ Мониторинг системы выключен")
+    else:
+        await message.answer("❗ Мониторинг не был включен")
 
 if __name__ == "__main__":
     logger.info("Бот запущен")
