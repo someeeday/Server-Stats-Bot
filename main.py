@@ -1,5 +1,5 @@
 import os
-import matplotlib
+import matplotlib # type: ignore
 matplotlib.use('Agg')  # Установка backend до импорта pyplot
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
@@ -173,22 +173,40 @@ async def get_linux_system_info(ssh_client: paramiko.SSHClient) -> dict:
             'kernel': "uname -r",
             'cpu_info': "grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs",
             'cpu_cores': "nproc",
-            'cpu_load': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",
+            'cpu_load': "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'",  # Изменено для более точного получения CPU
             'ram_total': "free -m | awk '/Mem:/ {print $2}'",
             'ram_used': "free -m | awk '/Mem:/ {print $3}'",
-            'disk_total': "df -h / | awk 'NR==2 {print $2}'",
-            'disk_used': "df -h / | awk 'NR==2 {print $3}'",
-            'disk_percent': "df -P / | awk 'NR==2 {print $5}' | tr -d '%'"
+            'disk_info': "df -h / | awk 'NR==2 {print $2,$3,$5}'"  # Получаем всю информацию о диске одной командой
         }
 
         system_data = {}
         for key, cmd in commands.items():
             system_data[key] = await execute_ssh_command(ssh_client, cmd)
 
-        # Форматируем данные о памяти
-        ram_total = float(system_data['ram_total'])
-        ram_used = float(system_data['ram_used'])
-        ram_percent = (ram_used / ram_total * 100) if ram_total > 0 else 0
+        # Обработка данных RAM
+        try:
+            ram_total = float(system_data['ram_total'])
+            ram_used = float(system_data['ram_used'])
+            ram_percent = (ram_used / ram_total * 100) if ram_total > 0 else 0
+            ram_text = f"{ram_used:.0f} MB / {ram_total:.0f} MB"
+        except:
+            ram_percent = 0
+            ram_text = "Неизвестно"
+
+        # Обработка данных диска
+        try:
+            disk_total, disk_used, disk_percent = system_data['disk_info'].split()
+            disk_text = f"{disk_used} / {disk_total}"
+            disk_percent = float(disk_percent.replace('%', ''))
+        except:
+            disk_text = "Неизвестно"
+            disk_percent = 0
+
+        # Обработка данных CPU
+        try:
+            cpu_percent = float(system_data['cpu_load'])
+        except:
+            cpu_percent = 0
 
         return {
             'Пользователь': await execute_ssh_command(ssh_client, 'whoami'),
@@ -196,11 +214,11 @@ async def get_linux_system_info(ssh_client: paramiko.SSHClient) -> dict:
             'Версия ОС': system_data['kernel'],
             'Процессор': system_data['cpu_info'],
             'Количество ядер': system_data['cpu_cores'],
-            'Загрузка процессора': f"{float(system_data['cpu_load']):.1f}",
-            'Оперативная память': f"{ram_used:.0f} MB / {ram_total:.0f} MB",
-            'Использование ОЗУ': f"{ram_percent:.1f}",
-            'Объем диска': f"{system_data['disk_used']} / {system_data['disk_total']}",
-            'Использование диска': system_data['disk_percent']
+            'Загрузка процессора': f"{cpu_percent}",
+            'Оперативная память': ram_text,
+            'Использование ОЗУ': f"{ram_percent}",
+            'Объем диска': disk_text,
+            'Использование диска': f"{disk_percent}"
         }
     except Exception as e:
         logger.error(f"Ошибка сбора информации Linux: {e}")

@@ -152,9 +152,9 @@ class SystemMonitor:
         self.current_intervals = {}  # хранение текущих интервалов для каждого пользователя
 
         self.linux_commands = {
-            'cpu': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",
-            'ram': "free | awk '/Mem:/ {print int($3/$2 * 100)}'",
-            'disk': "df -P / | tail -1 | awk '{print int($5)}'"
+            'cpu': "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'",
+            'ram': "free | awk '/Mem:/ {print ($3/$2)*100}'",
+            'disk': "df -P / | awk 'NR==2 {print $5}' | tr -d '%'"
         }
 
         self.windows_commands = {
@@ -165,9 +165,9 @@ class SystemMonitor:
 
         # Оптимизированные команды для Linux с использованием /proc и минимальной нагрузкой
         self.linux_commands = {
-            'cpu': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",  # Используем loadavg вместо текущей загрузки
-            'ram': "free | awk '/Mem:/ {print ($2-$4)/$2*100}'",  # Формула для процента использованной памяти
-            'disk': "df -P / | awk 'NR==2 {print $5}' | tr -d '%'"  # Удаляем символ % из вывода
+            'cpu': "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'",  # Используем loadavg вместо текущей загрузки
+            'ram': "free | awk '/Mem:/ {print ($3/$2)*100}'",  # Формула для процента использованной памяти
+            'disk': "df -P / | awk 'NR==2 {print $5}' | tr -д '%'"
         }
         
         # Оптимизированные команды для Windows
