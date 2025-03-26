@@ -166,15 +166,15 @@ class SystemMonitor:
         # Оптимизированные команды для Linux с использованием /proc и минимальной нагрузкой
         self.linux_commands = {
             'cpu': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",  # Используем loadavg вместо текущей загрузки
-            'ram': "free -b | awk '/Mem:/ {printf \"%.1f\", $3*100/$2}'",  # Используем байты для точности
-            'disk': "df -P / | tail -1 | awk '{print int($5)}'"
+            'ram': "free | awk '/Mem:/ {print ($2-$4)/$2*100}'",  # Формула для процента использованной памяти
+            'disk': "df -P / | awk 'NR==2 {print $5}' | tr -d '%'"  # Удаляем символ % из вывода
         }
         
         # Оптимизированные команды для Windows
         self.windows_commands = {
-            'cpu': 'powershell -command "$loadAvg=(Get-CimInstance Win32_Processor).LoadPercentage;Write-Output $loadAvg"',
-            'ram': 'powershell -command "$os=Get-CimInstance Win32_OperatingSystem;$total=$os.TotalVisibleMemorySize;$free=$os.FreePhysicalMemory;Write-Output ([math]::Round(($total-$free)/$total*100,1))"',
-            'disk': 'powershell -command "$disk=Get-PSDrive C;Write-Output ([math]::Round($disk.Used/($disk.Used+$disk.Free)*100,1))"'
+            'cpu': 'powershell "$loadAvg=(Get-CimInstance Win32_Processor).LoadPercentage;Write-Output $loadAvg"',
+            'ram': 'powershell "$os=Get-CimInstance Win32_OperatingSystem;Write-Output ([math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize*100,1))"',
+            'disk': 'powershell "$disk=Get-PSDrive C;Write-Output ([math]::Round($disk.Used/($disk.Used+$disk.Free)*100,1))"'
         }
 
     def _calculate_check_interval(self, metrics):
@@ -308,7 +308,11 @@ class SystemMonitor:
         for resource, command in commands.items():
             try:
                 _, stdout, _ = client.exec_command(command, timeout=5)
-                value = float(stdout.read().decode().strip())
+                output = stdout.read().decode().strip()
+                # Убираем символ % если он есть
+                if '%' in output:
+                    output = output.replace('%', '')
+                value = float(output)
                 metrics[resource] = max(0.0, min(100.0, value))  # Нормализация значений
             except Exception as e:
                 logger.error(f"Ошибка сбора метрики {resource}: {e}")

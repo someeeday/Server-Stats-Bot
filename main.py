@@ -40,8 +40,8 @@ BOT_MESSAGES = {
              "📋 Доступные команды:\n"
              "/log - Отчет о системе\n"
              "/ssh - Настройка подключения\n"
-             "/start\_monitor - Включить мониторинг\n"
-             "/stop\_monitor - Выключить мониторинг"),
+             "/start_monitor - Включить мониторинг\n"
+             "/stop_monitor - Выключить мониторинг"),
     'ssh_prompt': "Введите данные подключения в формате user@host:",
     'ssh_exists': "Активное подключение: {user}@{host}\nДля новой настройки нажмите кнопку ниже.",
     'ssh_success': "✅ Подключение успешно настроено",
@@ -51,7 +51,7 @@ BOT_MESSAGES = {
                         "с рекомендациями по их устранению."),
     'monitoring_enabled': ("✅ Мониторинг включен\n\n"
                          "Вы будете получать уведомления при проблемах.\n"
-                         "Для отключения используйте /stop\_monitor"),
+                         "Для отключения используйте /stop_monitor"),
     'monitoring_exists': "❗ Мониторинг уже запущен",
     'monitoring_disabled': "✅ Мониторинг отключен",
     'monitoring_not_running': "❗ Мониторинг не был включен",
@@ -169,18 +169,26 @@ async def get_linux_system_info(ssh_client: paramiko.SSHClient) -> dict:
     """Сбор информации о Linux системе."""
     try:
         commands = {
-            'cpu_load': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",
-            'ram_usage': "free -b | awk '/Mem:/ {printf \"%.1f|%.1f\", $3/1024/1024, $2/1024/1024}'",
-            'disk_usage': "df -B1 / | awk 'NR==2 {printf \"%.1f|%.1f\", $3/1024/1024, $2/1024/1024}'",
             'os_info': "grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"'",
             'kernel': "uname -r",
             'cpu_info': "grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs",
-            'cpu_cores': "nproc"
+            'cpu_cores': "nproc",
+            'cpu_load': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",
+            'ram_total': "free -m | awk '/Mem:/ {print $2}'",
+            'ram_used': "free -m | awk '/Mem:/ {print $3}'",
+            'disk_total': "df -h / | awk 'NR==2 {print $2}'",
+            'disk_used': "df -h / | awk 'NR==2 {print $3}'",
+            'disk_percent': "df -P / | awk 'NR==2 {print $5}' | tr -d '%'"
         }
 
         system_data = {}
         for key, cmd in commands.items():
             system_data[key] = await execute_ssh_command(ssh_client, cmd)
+
+        # Форматируем данные о памяти
+        ram_total = float(system_data['ram_total'])
+        ram_used = float(system_data['ram_used'])
+        ram_percent = (ram_used / ram_total * 100) if ram_total > 0 else 0
 
         return {
             'Пользователь': await execute_ssh_command(ssh_client, 'whoami'),
@@ -188,9 +196,11 @@ async def get_linux_system_info(ssh_client: paramiko.SSHClient) -> dict:
             'Версия ОС': system_data['kernel'],
             'Процессор': system_data['cpu_info'],
             'Количество ядер': system_data['cpu_cores'],
-            'Загрузка процессора': system_data['cpu_load'],
-            'Использование ОЗУ': system_data['ram_usage'].split('|')[0],
-            'Использование диска': system_data['disk_usage'].split('|')[0]
+            'Загрузка процессора': f"{float(system_data['cpu_load']):.1f}",
+            'Оперативная память': f"{ram_used:.0f} MB / {ram_total:.0f} MB",
+            'Использование ОЗУ': f"{ram_percent:.1f}",
+            'Объем диска': f"{system_data['disk_used']} / {system_data['disk_total']}",
+            'Использование диска': system_data['disk_percent']
         }
     except Exception as e:
         logger.error(f"Ошибка сбора информации Linux: {e}")
@@ -650,7 +660,7 @@ async def process_monitor_callback(callback_query: types.CallbackQuery):
     else:
         await callback_query.message.edit_text(
             "👌 Хорошо, мониторинг не будет включен.\n"
-            "Вы всегда можете включить его позже командой /start\_monitor"
+            "Вы всегда можете включить его позже командой /start_monitor"
         )
 
 @dp.message_handler(commands=["start_monitor"])
