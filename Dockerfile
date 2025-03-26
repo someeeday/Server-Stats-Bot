@@ -7,6 +7,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
+    libc-dev \
+    libffi-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование и установка зависимостей
@@ -23,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fontconfig \
     fonts-dejavu \
     locales \
+    libcairo2 \
+    libffi8 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && sed -i -e 's/# ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen \
@@ -52,8 +57,8 @@ RUN mkdir -p /usr/local/share/fonts/custom \
 # Копирование исходного кода
 COPY . .
 
-# Проверка наличия необходимых файлов
-RUN python -c "import matplotlib; import reportlab"
+# Проверка наличия необходимых файлов и настройка matplotlib для работы без GUI
+RUN python -c "import matplotlib; matplotlib.use('Agg'); import reportlab"
 
 # Пользователь с ограниченными правами
 RUN useradd -m -r -s /bin/bash botuser \

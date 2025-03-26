@@ -1,4 +1,6 @@
 import os
+import matplotlib
+matplotlib.use('Agg')  # Установка backend до импорта pyplot
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from matplotlib.figure import Figure # type: ignore
