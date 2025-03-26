@@ -1,17 +1,43 @@
+version: '3.8'
+
 services:
   bot:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: 1
     container_name: server-stats-bot
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DOCKER_BUILDKIT: 1
-      COMPOSE_DOCKER_CLI_BUILD: 1
+      - TZ=Europe/Moscow
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
     volumes:
-      - ./pdf-storage:/app-pdfs
-      - ./logs:/app/logs
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - ./pdf-storage:/app-pdfs:rw
+      - ./logs:/app/logs:rw
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true

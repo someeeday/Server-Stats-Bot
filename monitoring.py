@@ -2,61 +2,66 @@ import asyncio
 from datetime import datetime, timedelta
 import logging
 import paramiko # type: ignore
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 import time
 import json
-from main import logger
+from logger import logger
 
 THRESHOLDS = {
-    'cpu': 90,
-    'ram': 90,
-    'disk': 90
+    'cpu': 90.0,  # Типизируем как float
+    'ram': 90.0,
+    'disk': 90.0
+}
+
+LOG_MESSAGES = {
+    'monitor_start': "Мониторинг запущен для {user_id}",
+    'monitor_stop': "Мониторинг остановлен для {user_id}",
+    'metrics_error': "Ошибка получения метрик: {error}",
+    'high_load': "{resource}: {value:.1f}% (порог {threshold}%)",
+    'load_normalized': "{resource} в норме: {value:.1f}%"
 }
 
 RECOMMENDATIONS = {
     'cpu': [
-        "• Проверьте запущенные процессы командой `top` или `htop`",
+        "• Проверьте нагрузку процессов (top/htop)",
         "• Завершите неиспользуемые процессы",
-        "• Рассмотрите возможность обновления CPU или распределения нагрузки"
+        "• Рассмотрите масштабирование"
     ],
     'ram': [
-        "• Очистите кэш и временные файлы",
-        "• Проверьте процессы, потребляющие много памяти",
-        "• Рассмотрите возможность добавления RAM или включения swap"
+        "• Очистите системный кэш",
+        "• Проверьте утечки памяти",
+        "• Увеличьте объем RAM/swap"
     ],
     'disk': [
-        "• Удалите ненужные файлы и очистите корзину",
-        "• Проверьте самые большие файлы командой `du -h`",
-        "• Рассмотрите возможность расширения диска"
+        "• Очистите системные логи",
+        "• Удалите временные файлы",
+        "• Расширьте дисковое пространство"
     ]
 }
 
 class SSHPool:
-    def __init__(self):
-        """Инициализация пула SSH-соединений с автоматической очисткой неактивных соединений"""
+    """Оптимизированный пул SSH-соединений."""
+    def __init__(self, timeout: int = 300):
         self.connections: Dict[int, paramiko.SSHClient] = {}
         self.last_used: Dict[int, float] = {}
-        self.timeout = 300
+        self.timeout = timeout
         
-    def get_connection(self, user_id: int, ssh_data: dict) -> paramiko.SSHClient:
-        """
-        Получает существующее или создает новое SSH-соединение.
-        
-        Args:
-            user_id: ID пользователя
-            ssh_data: Словарь с параметрами подключения (hostname, username, password, port)
-            
-        Returns:
-            Объект SSH-соединения
-        """
+    def get_connection(self, user_id: int, ssh_data: dict) -> Tuple[paramiko.SSHClient, bool]:
+        """Получение существующего или создание нового соединения."""
         current_time = time.time()
-        
         self._cleanup(current_time)
         
+        is_new = False
         if user_id in self.connections:
             self.last_used[user_id] = current_time
-            return self.connections[user_id]
-            
+            try:
+                # Проверяем активность соединения
+                self.connections[user_id].exec_command('echo 1', timeout=2)
+                return self.connections[user_id], is_new
+            except:
+                self.close_connection(user_id)
+        
+        is_new = True
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
@@ -70,37 +75,46 @@ class SSHPool:
         
         self.connections[user_id] = client
         self.last_used[user_id] = current_time
-        return client
-        
+        return client, is_new
+
     def _cleanup(self, current_time: float):
+        """Очистка неактивных соединений."""
         for user_id in list(self.connections.keys()):
             if current_time - self.last_used[user_id] > self.timeout:
                 self.close_connection(user_id)
                 
     def close_connection(self, user_id: int):
+        """Безопасное закрытие соединения."""
         if user_id in self.connections:
             try:
                 self.connections[user_id].close()
-            except:
-                pass
-            del self.connections[user_id]
-            del self.last_used[user_id]
+            except Exception as e:
+                logger.error(f"Ошибка закрытия SSH соединения: {e}")
+            finally:
+                del self.connections[user_id]
+                del self.last_used[user_id]
 
 class MetricsCache:
+    """Кэширование метрик с улучшенной валидацией."""
     def __init__(self, ttl: int = 30):
-        self.cache: Dict[int, Dict[str, Any]] = {}
+        self.cache: Dict[int, Dict[str, float]] = {}
         self.ttl = ttl
         self.last_update: Dict[int, float] = {}
         
-    def get(self, user_id: int) -> Dict[str, Any] | None:
-        if user_id in self.cache:
-            if time.time() - self.last_update[user_id] < self.ttl:
-                return self.cache[user_id]
+    def get(self, user_id: int) -> Optional[Dict[str, float]]:
+        if user_id in self.cache and time.time() - self.last_update[user_id] < self.ttl:
+            return self.cache[user_id]
         return None
         
-    def set(self, user_id: int, data: Dict[str, Any]):
+    def set(self, user_id: int, data: Dict[str, float]):
         self.cache[user_id] = data
         self.last_update[user_id] = time.time()
+        
+    def invalidate(self, user_id: int):
+        """Инвалидация кэша для пользователя."""
+        if user_id in self.cache:
+            del self.cache[user_id]
+            del self.last_update[user_id]
 
 def format_size(size: float, unit: str) -> str:
     if unit.upper() == 'MB':
@@ -114,6 +128,7 @@ def format_size(size: float, unit: str) -> str:
     return f"{size} {unit}"
 
 class SystemMonitor:
+    """Оптимизированный монитор системы."""
     def __init__(self, bot):
         """
         Инициализация системы мониторинга с адаптивным интервалом проверки.
@@ -249,138 +264,99 @@ class SystemMonitor:
             if user_id in self.current_intervals:
                 del self.current_intervals[user_id]
 
-    async def _get_metrics(self, user_id: int, ssh_data: dict) -> dict:
-        cached_data = self.metrics_cache.get(user_id)
-        if cached_data:
-            return cached_data
-            
+    async def _get_metrics(self, user_id: int, ssh_data: dict) -> Dict[str, float]:
+        """Получение метрик с оптимизированным кэшированием."""
         try:
-            ssh = self.ssh_pool.get_connection(user_id, ssh_data)
+            cached_data = self.metrics_cache.get(user_id)
+            if cached_data:
+                return cached_data
+
+            client, is_new = self.ssh_pool.get_connection(user_id, ssh_data)
             
             try:
-                ssh.get_transport().request_port_forward('', self.agent_port, 'localhost', self.agent_port)
+                # Определяем ОС только для новых соединений
+                if is_new:
+                    os_type = await self._detect_os_type(client)
+                    ssh_data['os_type'] = os_type
                 
-                _, stdout, _ = ssh.exec_command(f'curl -s http://localhost:{self.agent_port}/metrics', timeout=5)
-                metrics_data = stdout.read().decode().strip()
-                metrics = json.loads(metrics_data)
-                
+                metrics = await self._collect_metrics(client, ssh_data.get('os_type', 'linux'))
                 self.metrics_cache.set(user_id, metrics)
                 return metrics
                 
-            except Exception as agent_error:
-                logger.warning(f"Не удалось получить метрики от агента: {agent_error}. Используем старый метод.")
-                return await self._get_metrics_legacy(ssh)
-            
+            except Exception as e:
+                logger.error(f"Ошибка сбора метрик: {e}")
+                self.metrics_cache.invalidate(user_id)
+                return {}
+                
         except Exception as e:
-            logger.error(f"Ошибка при получении метрик: {e}")
-            return {'cpu': 0, 'ram': 0, 'disk': 0}
+            logger.error(f"Ошибка подключения: {e}")
+            return {}
 
-    async def _get_metrics_legacy(self, ssh):
-        """
-        Получает метрики системы через SSH с минимальной нагрузкой.
-        Использует легкие команды для сбора данных о CPU, RAM и диске.
-        
-        Args:
-            ssh: Активное SSH-соединение
-            
-        Returns:
-            dict: Словарь с метриками системы {cpu: float, ram: float, disk: float}
-        """
+    async def _detect_os_type(self, client: paramiko.SSHClient) -> str:
+        """Определение типа ОС с кэшированием результата."""
         try:
-            if not hasattr(self, '_cached_os_type'):
-                self._cached_os_type = "windows" if self._is_windows(ssh) else "linux"
-            
-            commands = self.windows_commands if self._cached_os_type == "windows" else self.linux_commands
-            
-            # Выполняем все команды одновременно для оптимизации
-            combined_cmd = " && ".join([f"echo '{k}='$({v})" for k, v in commands.items()])
-            if self._cached_os_type == "windows":
-                combined_cmd = 'powershell -command "' + combined_cmd + '"'
-            
-            _, stdout, _ = ssh.exec_command(combined_cmd, timeout=3)
-            output = stdout.read().decode().strip()
-            
-            metrics = {}
-            for line in output.split('\n'):
-                if '=' in line:
-                    key, value = line.strip().split('=')
-                    try:
-                        metrics[key] = float(value)
-                    except ValueError:
-                        metrics[key] = 0
-            
-            return metrics
-            
-        except Exception as e:
-            logger.error(f"Ошибка при получении метрик: {e}")
-            return None
+            _, stdout, _ = client.exec_command('ver', timeout=5)
+            return 'windows' if 'windows' in stdout.read().decode().lower() else 'linux'
+        except:
+            return 'linux'
 
-    async def _check_thresholds(self, user_id: int, metrics: dict):
-        """
-        Проверяет метрики на превышение пороговых значений с учетом ложных срабатываний.
-        Отправляет уведомления только при подтвержденных проблемах.
-        
-        Args:
-            user_id: ID пользователя для отправки уведомлений
-            metrics: Словарь с текущими метриками
-        """
+    async def _collect_metrics(self, client: paramiko.SSHClient, os_type: str) -> Dict[str, float]:
+        """Сбор метрик с валидацией значений."""
+        commands = self.windows_commands if os_type == 'windows' else self.linux_commands
+        metrics = {}
+
+        for resource, command in commands.items():
+            try:
+                _, stdout, _ = client.exec_command(command, timeout=5)
+                value = float(stdout.read().decode().strip())
+                metrics[resource] = max(0.0, min(100.0, value))  # Нормализация значений
+            except Exception as e:
+                logger.error(f"Ошибка сбора метрики {resource}: {e}")
+                metrics[resource] = 0.0
+
+        return metrics
+
+    async def _check_thresholds(self, user_id: int, metrics: Dict[str, float]):
+        """Проверка пороговых значений с защитой от ложных срабатываний."""
         if not metrics:
             return
-            
+
         current_time = time.time()
-        min_alert_interval = 3600
-        
-        if user_id not in self.alert_states:
-            self.alert_states[user_id] = {k: False for k in THRESHOLDS.keys()}
-            self.last_alert_time[user_id] = {k: 0 for k in THRESHOLDS.keys()}
-            self.high_load_counter[user_id] = {k: 0 for k in THRESHOLDS.keys()}
+        alert_cooldown = 3600  # Кулдаун уведомлений - 1 час
 
-        alerts_to_send = []
-        resolved_alerts = []
+        alerts = []
+        resolved = []
 
-        for resource in THRESHOLDS.keys():
-            current_value = metrics.get(resource, 0)
-            prev_value = self.last_metrics.get(user_id, {}).get(resource, 0)
-            is_critical = current_value >= THRESHOLDS[resource]
-            prev_state = self.alert_states[user_id][resource]
-            last_alert = self.last_alert_time[user_id][resource]
-
-            if is_critical and abs(current_value - prev_value) > 40:
+        for resource, current_value in metrics.items():
+            if resource not in THRESHOLDS:
                 continue
 
-            if is_critical:
-                self.high_load_counter[user_id][resource] += 1
-            else:
-                self.high_load_counter[user_id][resource] = 0
+            threshold = THRESHOLDS[resource]
+            prev_state = self.alert_states.get(user_id, {}).get(resource, False)
+            last_alert = self.last_alert_time.get(user_id, {}).get(resource, 0)
 
-            if (is_critical and 
-                self.high_load_counter[user_id][resource] >= self.false_positive_threshold and 
-                (not prev_state or current_time - last_alert >= min_alert_interval)):
-                alerts_to_send.append((resource, current_value))
-                self.last_alert_time[user_id][resource] = current_time
-            elif not is_critical and prev_state:
-                resolved_alerts.append(resource)
-                self.high_load_counter[user_id][resource] = 0
+            if current_value >= threshold:
+                if not prev_state or current_time - last_alert >= alert_cooldown:
+                    alerts.append((resource, current_value, threshold))
+                    self.last_alert_time.setdefault(user_id, {})[resource] = current_time
+            elif prev_state:
+                resolved.append((resource, current_value))
 
-            self.alert_states[user_id][resource] = is_critical
+            self.alert_states.setdefault(user_id, {})[resource] = current_value >= threshold
 
-        self.last_metrics[user_id] = metrics
-
-        if alerts_to_send:
-            message = "⚠️ *Подтверждена высокая нагрузка:*\n\n"
-            for resource, value in alerts_to_send:
-                message += f"*{self._get_resource_name(resource)}:* {value:.1f}%\n"
-                message += "*Рекомендации:*\n"
-                for rec in RECOMMENDATIONS[resource]:
-                    message += f"{rec}\n"
-                message += "\n"
+        if alerts:
+            message = "⚠️ *Критическая нагрузка:*\n\n"
+            for resource, value, threshold in alerts:
+                message += f"{LOG_MESSAGES['high_load'].format(resource=resource, value=value, threshold=threshold)}\n"
+                message += "*Рекомендации:*\n" + "\n".join(RECOMMENDATIONS[resource]) + "\n\n"
             
             await self.bot.send_message(user_id, message, parse_mode="Markdown")
 
-        if resolved_alerts:
-            message = "✅ *Нагрузка нормализовалась:*\n\n"
-            for resource in resolved_alerts:
-                message += f"*{self._get_resource_name(resource)}*\n"
+        if resolved:
+            message = "✅ *Нагрузка нормализовалась:*\n"
+            for resource, value in resolved:
+                message += LOG_MESSAGES['load_normalized'].format(resource=resource, value=value) + "\n"
+            
             await self.bot.send_message(user_id, message, parse_mode="Markdown")
 
     async def _check_metrics(self, user_id, system_data):
@@ -418,8 +394,8 @@ class SystemMonitor:
 
     def _get_resource_name(self, resource):
         names = {
-            'cpu': 'Загрузка процессора',
-            'ram': 'Использование памяти',
-            'disk': 'Использование диска'
+            'cpu': 'Процессор',
+            'ram': 'Память',
+            'disk': 'Диск'
         }
         return names.get(resource, resource)

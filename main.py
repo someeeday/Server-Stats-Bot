@@ -1,6 +1,4 @@
 import os
-import logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from matplotlib.figure import Figure # type: ignore
@@ -17,70 +15,100 @@ from reportlab.pdfbase.ttfonts import TTFont  # type: ignore
 import paramiko  # type: ignore
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton # type: ignore
 from monitoring import SystemMonitor
+from logger import logger
 
-PDF_STORAGE_PATH = "/app-pdfs"
-LOGS_PATH = "/app/logs"
-FONTS_PATH = "./fonts"
+# Константы и настройки
+PDF_STORAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf-storage")
+LOGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+FONTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
 MAX_FILES = 10
 DEFAULT_FONT = 'DejaVuSans'
+ALERT_COOLDOWN = 3600  # 1 час
+MAX_FAILED_ATTEMPTS = 3
+LOCKOUT_TIME = 300  # 5 минут блокировки
 
+# Создание необходимых директорий
 for path in [LOGS_PATH, PDF_STORAGE_PATH]:
-    if not os.path.exists(path):
-        try:
-            os.makedirs(path)
-        except Exception as e:
-            print(f"Ошибка при создании папки {path}: {e}")
+    os.makedirs(path, exist_ok=True)
 
-LOG_FILE = os.path.join(LOGS_PATH, "debug.log")
-MAX_LOG_SIZE = 5 * 1024 * 1024  
-BACKUP_COUNT = 3
-
-handler = RotatingFileHandler(
-    LOG_FILE,
-    maxBytes=MAX_LOG_SIZE,
-    backupCount=BACKUP_COUNT,
-    encoding='utf-8'
-)
-handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-))
-
-logger = logging.getLogger("server-stats-bot")
-logger.setLevel(logging.INFO)
-logger.addHandler(handler)
+# Сообщения бота
+BOT_MESSAGES = {
+    'start': ("🤖 *Бот мониторинга серверов*\n\n"
+             "📋 Доступные команды:\n"
+             "/log - Отчет о системе\n"
+             "/ssh - Настройка подключения\n"
+             "/start_monitor - Включить мониторинг\n"
+             "/stop_monitor - Выключить мониторинг"),
+    'ssh_prompt': "Введите данные подключения в формате user@host:",
+    'ssh_exists': "Активное подключение: {user}@{host}\nДля новой настройки нажмите кнопку ниже.",
+    'ssh_success': "✅ Подключение успешно настроено",
+    'ssh_error': "❌ Ошибка подключения. Проверьте данные",
+    'monitoring_offer': ("📊 Включить мониторинг системы?\n\n"
+                        "Вы будете получать уведомления о критических ситуациях\n"
+                        "с рекомендациями по их устранению."),
+    'monitoring_enabled': ("✅ Мониторинг включен\n\n"
+                         "Вы будете получать уведомления при проблемах.\n"
+                         "Для отключения используйте /stop_monitor"),
+    'monitoring_exists': "❗ Мониторинг уже запущен",
+    'monitoring_disabled': "✅ Мониторинг отключен",
+    'monitoring_not_running': "❗ Мониторинг не был включен",
+    'no_ssh': "❌ SSH не настроен. Используйте /ssh для настройки",
+    'report_generating': "📊 Генерация отчета...",
+    'report_error': "❌ Ошибка создания отчета",
+    'rate_limit': "⚠️ Слишком много попыток. Подождите {minutes} мин."
+}
 
 def register_fonts():
-    """Регистрирует шрифты из папки fonts."""
+    """Регистрация шрифтов с обработкой ошибок."""
     try:
         font_path = os.path.join(FONTS_PATH, "DejaVuSans.ttf")
         if os.path.exists(font_path):
             pdfmetrics.registerFont(TTFont('DejaVuSans', font_path))
-            logger.info("DejaVuSans успешно зарегистрирован")
+            logger.info("Шрифт DejaVuSans успешно зарегистрирован")
             return True
+        logger.error("Файл шрифта не найден")
+        return False
     except Exception as e:
-        logger.error(f"Ошибка при регистрации шрифта: {e}")
+        logger.error(f"Ошибка регистрации шрифта: {e}")
         return False
 
 if not register_fonts():
-    raise ValueError("Не удалось зарегистрировать шрифт DejaVuSans")
+    raise ValueError("Не удалось зарегистрировать необходимые шрифты")
 
+# Проверка и получение токена
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
-    logger.error("Переменная окружения BOT_TOKEN не задана!")
-    raise ValueError("Переменная окружения BOT_TOKEN не задана!")
+    logger.error("BOT_TOKEN не задан в переменных окружения")
+    raise ValueError("BOT_TOKEN не задан")
 
+# Инициализация бота
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
-
 monitor = SystemMonitor(bot)
 
+# Состояния и кэши
+user_states = {}
+ssh_connections = {}
+failed_attempts = {}
+locked_users = {}
+
+# Запрещенные хосты
+BLOCKED_HOSTS = {
+    'localhost', '127.0.0.1', '::1',
+    '0.0.0.0', '0.0.0.0/0',
+    '10.0.0.0/8',
+    '172.16.0.0/12',
+    '192.168.0.0/16',
+    'fc00::/7'
+}
+
 def cleanup_old_pdfs():
-    """Удаляет старые файлы, оставляя только последние MAX_FILES."""
+    """Очистка старых PDF файлов с логированием."""
     try:
         files = sorted(
-            [os.path.join(PDF_STORAGE_PATH, f) for f in os.listdir(PDF_STORAGE_PATH) if f.endswith('.pdf')],
+            [os.path.join(PDF_STORAGE_PATH, f) for f in os.listdir(PDF_STORAGE_PATH) 
+             if f.endswith('.pdf')],
             key=os.path.getmtime
         )
         if len(files) > MAX_FILES:
@@ -90,196 +118,169 @@ def cleanup_old_pdfs():
     except Exception as e:
         logger.error(f"Ошибка при очистке старых файлов: {e}")
 
-def execute_ssh_command(ssh_client, command, timeout=10):
-    """Выполняет SSH-команду и возвращает результат."""
+def is_host_allowed(hostname: str) -> bool:
+    """Проверка безопасности хоста."""
     try:
-        _, stdout, _ = ssh_client.exec_command(command, timeout=timeout)
+        if not hostname or not isinstance(hostname, str):
+            return False
+            
+        if any(char in hostname for char in ';&|`$(){}[]<>\\'):
+            return False
+            
+        for blocked in BLOCKED_HOSTS:
+            if hostname.startswith(blocked.split('/')[0]):
+                return False
+                
+        return True
+    except Exception:
+        return False
+
+def check_rate_limit(user_id: int) -> bool:
+    """Проверка ограничения попыток."""
+    current_time = datetime.now()
+    if user_id in locked_users:
+        if (current_time - locked_users[user_id]).total_seconds() < LOCKOUT_TIME:
+            return False
+        del locked_users[user_id]
+        failed_attempts[user_id] = 0
+    return True
+
+def record_failed_attempt(user_id: int):
+    """Запись неудачной попытки."""
+    failed_attempts[user_id] = failed_attempts.get(user_id, 0) + 1
+    if failed_attempts[user_id] >= MAX_FAILED_ATTEMPTS:
+        locked_users[user_id] = datetime.now()
+
+async def execute_ssh_command(ssh_client: paramiko.SSHClient, command: str, timeout: int = 10) -> str:
+    """Выполнение SSH команды с обработкой ошибок."""
+    try:
+        _, stdout, stderr = ssh_client.exec_command(command, timeout=timeout)
+        error = stderr.read().decode().strip()
+        if error:
+            logger.warning(f"SSH команда вернула ошибку: {error}")
         return stdout.read().decode().strip()
     except Exception as e:
-        logger.error(f"Ошибка выполнения команды '{command}': {e}", exc_info=True)
+        logger.error(f"Ошибка выполнения '{command}': {e}")
         return "Неизвестно"
 
-def get_linux_system_info(ssh_client):
-    """
-    Собирает информацию о системе Linux через SSH.
-    Использует оптимизированные команды с минимальной нагрузкой на систему.
-    """
+async def get_linux_system_info(ssh_client: paramiko.SSHClient) -> dict:
+    """Сбор информации о Linux системе."""
     try:
-        cpu_cmd = "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'"  # Используем loadavg вместо top
-        ram_cmd = "free -b | awk '/Mem:/ {printf \"%.0f|%.0f\", $3/1024/1024, $2/1024/1024}'"
-        disk_cmd = "df -B1 / | awk 'NR==2 {printf \"%.0f|%.0f\", $3/1024/1024/1024, $2/1024/1024/1024}'"
-
-        cpu_cores_cmd = "nproc"
-        ram_total_cmd = "free -h | awk '/^Mem:/ {print $2}'"
-        ram_used_cmd = "free -h | awk '/^Mem:/ {print $3}'"
-        disk_total_cmd = "df -h / | awk 'NR==2 {print $2}'"
-        disk_used_cmd = "df -h / | awk 'NR==2 {print $3}'"
-
-        cpu_usage = execute_ssh_command(ssh_client, cpu_cmd)
-        ram_usage = execute_ssh_command(ssh_client, ram_cmd)
-        disk_usage = execute_ssh_command(ssh_client, disk_cmd)
-
-        logger.info(f"Linux метрики - CPU: '{cpu_usage}', RAM: '{ram_usage}', Disk: '{disk_usage}'")
-
-        system_data = {
-            'Пользователь': execute_ssh_command(ssh_client, 'whoami'),
-            'Хост': execute_ssh_command(ssh_client, 'hostname'),
-            'Операционная система': execute_ssh_command(ssh_client, "grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"'"),
-            'Версия ОС': execute_ssh_command(ssh_client, 'uname -r'),
-            'Процессор': execute_ssh_command(ssh_client, "grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs"),
-            'Количество ядер': execute_ssh_command(ssh_client, 'nproc'),
-            'Оперативная память': execute_ssh_command(ssh_client, "free -h | awk '/^Mem:/ {print $2}'"),
-            'Объем диска': execute_ssh_command(ssh_client, "df -h / | awk 'NR==2 {print $2}'"),
-            'Загрузка процессора': cpu_usage if cpu_usage != "Неизвестно" else "50",
-            'Использование ОЗУ': ram_usage if ram_usage != "Неизвестно" else "60",
-            'Использование диска': disk_usage if disk_usage != "Неизвестно" else "70",
-            'Всего ядер': execute_ssh_command(ssh_client, cpu_cores_cmd),
-            'Всего ОЗУ': execute_ssh_command(ssh_client, ram_total_cmd),
-            'Использовано ОЗУ': execute_ssh_command(ssh_client, ram_used_cmd),
-            'Всего диск': execute_ssh_command(ssh_client, disk_total_cmd),
-            'Использовано диск': execute_ssh_command(ssh_client, disk_used_cmd),
+        commands = {
+            'cpu_load': "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'",
+            'ram_usage': "free -b | awk '/Mem:/ {printf \"%.1f|%.1f\", $3/1024/1024, $2/1024/1024}'",
+            'disk_usage': "df -B1 / | awk 'NR==2 {printf \"%.1f|%.1f\", $3/1024/1024, $2/1024/1024}'",
+            'os_info': "grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"'",
+            'kernel': "uname -r",
+            'cpu_info': "grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs",
+            'cpu_cores': "nproc"
         }
-        logger.info(f"Метрики системы: {system_data.get('Загрузка процессора')}, {system_data.get('Использование ОЗУ')}, {system_data.get('Использование диска')}")
-        return system_data
-    except Exception as e:
-        logger.error(f"Ошибка при сборе информации о Linux: {e}", exc_info=True)
+
+        system_data = {}
+        for key, cmd in commands.items():
+            system_data[key] = await execute_ssh_command(ssh_client, cmd)
+
         return {
-            'Загрузка процессора': "30", 
-            'Использование ОЗУ': "50", 
-            'Использование диска': "70"
+            'Пользователь': await execute_ssh_command(ssh_client, 'whoami'),
+            'Операционная система': system_data['os_info'],
+            'Версия ОС': system_data['kernel'],
+            'Процессор': system_data['cpu_info'],
+            'Количество ядер': system_data['cpu_cores'],
+            'Загрузка процессора': system_data['cpu_load'],
+            'Использование ОЗУ': system_data['ram_usage'].split('|')[0],
+            'Использование диска': system_data['disk_usage'].split('|')[0]
         }
+    except Exception as e:
+        logger.error(f"Ошибка сбора информации Linux: {e}")
+        return {}
 
-def get_windows_system_info(ssh_client):
-    """
-    Собирает информацию о системе Windows.
-    
-    Использует PowerShell команды для эффективного сбора данных:
-    - Загрузка CPU через WMI
-    - Использование памяти через Win32_OperatingSystem
-    - Использование диска через Get-PSDrive
-    
-    Args:
-        ssh_client: Активное SSH-соединение
-        
-    Returns:
-        dict: Полная информация о системе включая абсолютные значения ресурсов
-    """
+async def get_windows_system_info(ssh_client: paramiko.SSHClient) -> dict:
+    """Сбор информации о Windows системе."""
     try:
-        cpu_cmd = 'powershell.exe -command "try { $cpu = Get-Counter -Counter \"\\Processor(_Total)\\% Processor Time\" -ErrorAction Stop; Write-Output ([Math]::Round($cpu.CounterSamples.CookedValue)) } catch { Write-Output 40 }"'
-        ram_cmd = 'powershell.exe -command "try { $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop; $used = $os.TotalVisibleMemorySize - $os.FreePhysicalMemory; Write-Output ([Math]::Round($used / $os.TotalVisibleMemorySize * 100)) } catch { Write-Output 50 }"'
-        disk_cmd = 'powershell.exe -command "try { $drive = Get-PSDrive C -ErrorAction Stop; Write-Output ([Math]::Round($drive.Used / ($drive.Used + $drive.Free) * 100)) } catch { Write-Output 60 }"'
-
-        cpu_cores_cmd = 'powershell.exe -command "(Get-WmiObject -Class Win32_Processor).NumberOfLogicalProcessors"'
-        ram_total_cmd = 'powershell.exe -command "Get-WmiObject -Class Win32_ComputerSystem | % {[math]::Round($_.TotalPhysicalMemory/1GB)}"'
-        ram_used_cmd = 'powershell.exe -command "$os = Get-WmiObject -Class Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1MB)"'
-        disk_total_cmd = 'powershell.exe -command "$disk = Get-PSDrive C; [math]::Round(($disk.Used + $disk.Free)/1GB)"'
-        disk_used_cmd = 'powershell.exe -command "$disk = Get-PSDrive C; [math]::Round($disk.Used/1GB)"'
-
-        cpu_usage = execute_ssh_command(ssh_client, cpu_cmd)
-        ram_usage = execute_ssh_command(ssh_client, ram_cmd)
-        disk_usage = execute_ssh_command(ssh_client, disk_cmd)
-
-        logger.info(f"Windows метрики - CPU: '{cpu_usage}', RAM: '{ram_usage}', Disk: '{disk_usage}'")
-
-        system_data = {
-            'Пользователь': execute_ssh_command(ssh_client, 'powershell.exe -command "$env:USERNAME"'),
-            'Хост': execute_ssh_command(ssh_client, 'powershell.exe -command "$env:COMPUTERNAME"'),
-            'Операционная система': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_OperatingSystem).Caption"'),
-            'Версия ОС': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_OperatingSystem).Version"'),
-            'Процессор': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_Processor).Name"'),
-            'Количество ядер': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_ComputerSystem).NumberOfProcessors"'),
-            'Оперативная память': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_ComputerSystem).TotalPhysicalMemory | ForEach-Object { [Math]::Round($_ / 1MB, 0) }"') + " MB",
-            'Объем диска': execute_ssh_command(ssh_client, 'powershell.exe -command "(Get-WmiObject -Class Win32_DiskDrive | Select-Object Size | ForEach-Object { [Math]::Round($_.Size / 1GB, 0) })[0]"') + " GB",
-            'Загрузка процессора': cpu_usage if cpu_usage != "Неизвестно" else "40",
-            'Использование ОЗУ': ram_usage if ram_usage != "Неизвестно" else "50",
-            'Использование диска': disk_usage if disk_usage != "Неизвестно" else "60",
-            'Всего ядер': execute_ssh_command(ssh_client, cpu_cores_cmd),
-            'Всего ОЗУ': execute_ssh_command(ssh_client, ram_total_cmd),
-            'Использовано ОЗУ': execute_ssh_command(ssh_client, ram_used_cmd),
-            'Всего диск': execute_ssh_command(ssh_client, disk_total_cmd),
-            'Использовано диск': execute_ssh_command(ssh_client, disk_used_cmd),
+        commands = {
+            'cpu': 'powershell "$loadAvg=(Get-CimInstance Win32_Processor).LoadPercentage;$loadAvg"',
+            'ram': 'powershell "$os=Get-CimInstance Win32_OperatingSystem;[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize*100,1)"',
+            'disk': 'powershell "$disk=Get-PSDrive C;[math]::Round($disk.Used/($disk.Used+$disk.Free)*100,1)"',
+            'os_info': 'powershell "(Get-CimInstance Win32_OperatingSystem).Caption"',
+            'os_version': 'powershell "(Get-CimInstance Win32_OperatingSystem).Version"',
+            'cpu_info': 'powershell "(Get-CimInstance Win32_Processor).Name"',
+            'cpu_cores': 'powershell "(Get-CimInstance Win32_Processor).NumberOfLogicalProcessors"'
         }
-        logger.info(f"Метрики системы: {system_data.get('Загрузка процессора')}, {system_data.get('Использование ОЗУ')}, {system_data.get('Использование диска')}")
-        return system_data
-    except Exception as e:
-        logger.error(f"Ошибка при сборе информации о Windows: {e}", exc_info=True)
+
+        system_data = {}
+        for key, cmd in commands.items():
+            system_data[key] = await execute_ssh_command(ssh_client, cmd)
+
         return {
-            'Загрузка процессора': "40", 
-            'Использование ОЗУ': "50", 
-            'Использование диска': "60"
+            'Пользователь': await execute_ssh_command(ssh_client, 'powershell "$env:USERNAME"'),
+            'Операционная система': system_data['os_info'],
+            'Версия ОС': system_data['os_version'],
+            'Процессор': system_data['cpu_info'],
+            'Количество ядер': system_data['cpu_cores'],
+            'Загрузка процессора': system_data['cpu'],
+            'Использование ОЗУ': system_data['ram'],
+            'Использование диска': system_data['disk']
         }
+    except Exception as e:
+        logger.error(f"Ошибка сбора информации Windows: {e}")
+        return {}
 
-def determine_os_type(ssh_client):
-    """Определяет тип операционной системы (Linux или Windows)."""
-    output = execute_ssh_command(ssh_client, 'ver')
-    return "windows" if "windows" in output.lower() else "linux"
+async def determine_os_type(ssh_client: paramiko.SSHClient) -> str:
+    """Определение типа ОС."""
+    try:
+        output = await execute_ssh_command(ssh_client, 'ver')
+        return "windows" if "windows" in output.lower() else "linux"
+    except:
+        return "linux"
 
-def get_system_info_ssh(hostname, port, username, password):
-    """Подключается к удаленной системе по SSH и собирает информацию."""
+async def get_system_info_ssh(hostname: str, port: int, username: str, password: str) -> dict:
+    """Подключение и сбор информации о системе."""
     try:
         ssh_client = paramiko.SSHClient()
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(hostname=hostname, port=port, username=username, password=password, timeout=30)
+        ssh_client.connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            password=password,
+            timeout=30
+        )
 
-        os_type = determine_os_type(ssh_client)
-        system_data = get_linux_system_info(ssh_client) if os_type == "linux" else get_windows_system_info(ssh_client)
+        os_type = await determine_os_type(ssh_client)
+        system_data = (await get_windows_system_info(ssh_client) if os_type == "windows" 
+                      else await get_linux_system_info(ssh_client))
+        
         system_data.update({'IP-адрес': hostname, 'Порт SSH': port})
-
+        
         ssh_client.close()
         return system_data
     except Exception as e:
-        logger.error(f"Ошибка при подключении по SSH или сборе информации: {e}", exc_info=True)
+        logger.error(f"Ошибка SSH подключения: {e}")
         return {}
 
-def add_resource_charts(elements, system_data):
-    """Создает и добавляет круговые диаграммы использования ресурсов."""
+def add_resource_charts(elements: list, system_data: dict):
+    """Создание графиков использования ресурсов."""
     try:
-        logger.info(f"Получены данные для диаграмм: CPU={system_data.get('Загрузка процессора')}, RAM={system_data.get('Использование ОЗУ')}, Disk={system_data.get('Использование диска')}")
+        resources = [
+            ('Загрузка процессора', float(system_data.get('Загрузка процессора', 0))),
+            ('Использование ОЗУ', float(system_data.get('Использование ОЗУ', 0))),
+            ('Использование диска', float(system_data.get('Использование диска', 0)))
+        ]
 
         fig = Figure(figsize=(12, 4))
-
         colors = ['#FFB3BA', '#BAFFC9', '#BAE1FF']
         bg_colors = ['#FFE5E8', '#E8FFE5', '#E5F2FF']
 
-        test_values = {
-            'Использование ОЗУ': 50.0,
-            'Использование диска': 65.0,
-            'Загрузка процессора': 35.0
-        }
-
-        resources = []
-        for title, usage_key, total_key, used_key, default, unit in [
-            ('Использование ОЗУ', 'Использование ОЗУ', 'Всего ОЗУ', 'Использовано ОЗУ', 50.0, 'MB'),
-            ('Использование диска', 'Использование диска', 'Всего диск', 'Использовано диск', 65.0, 'GB'),
-            ('Загрузка процессора', 'Загрузка процессора', 'Всего ядер', None, 35.0, 'ядер')
-        ]:
-            try:
-                value = float(system_data.get(usage_key, default))
-                value = max(0, min(value, 100))
-
-                if usage_key == 'Загрузка процессора':
-                    total = system_data.get(total_key, '4')
-                    absolute_text = f"{total} {unit}"
-                else:
-                    total = system_data.get(total_key, '0')
-                    used = system_data.get(used_key, '0')
-                    absolute_text = f"{used}/{total} {unit}"
-
-            except Exception as e:
-                value = default
-                absolute_text = "н/д"
-                logger.error(f"Ошибка при обработке значения для {usage_key}: {e}")
-            
-            resources.append((title, value, absolute_text))
-
-        for idx, (title, value, absolute_text) in enumerate(resources):
+        for idx, (title, value) in enumerate(resources):
+            value = max(0, min(value, 100))  # Нормализация значений
             ax = fig.add_subplot(131 + idx)
             sizes = [value, 100 - value]
             
-            ax.pie(sizes, colors=[colors[idx], bg_colors[idx]], startangle=90, 
-                  autopct='%1.1f%%', pctdistance=0.85,
+            ax.pie(sizes, colors=[colors[idx], bg_colors[idx]], 
+                  startangle=90, autopct='%1.1f%%',
+                  pctdistance=0.85,
                   wedgeprops={'edgecolor': 'white', 'linewidth': 1})
-            ax.set_title(f"{title}\n{absolute_text}", pad=20)
+            ax.set_title(title, pad=20)
 
         fig.tight_layout(pad=3.0)
         
@@ -290,16 +291,13 @@ def add_resource_charts(elements, system_data):
         img = Image(buf, width=7*inch, height=2.3*inch)
         elements.append(img)
         elements.append(Spacer(1, 0.2*inch))
-        logger.info("Таблица с графиками добавлена в PDF")
-
+        
     except Exception as e:
-        logger.error(f"Ошибка при создании диаграмм: {e}", exc_info=True)
-        elements.append(Paragraph("Не удалось создать диаграммы использования ресурсов.", ParagraphStyle(
-            'Error',
-            fontName=DEFAULT_FONT,
-            fontSize=12,
-            textColor=colors.red
-        )))
+        logger.error(f"Ошибка создания графиков: {e}")
+        elements.append(Paragraph(
+            "Не удалось создать графики использования ресурсов", 
+            ParagraphStyle('Error', fontName=DEFAULT_FONT, fontSize=12, textColor=colors.red)
+        ))
 
 def generate_system_report_pdf(system_data=None):
     """
@@ -426,75 +424,10 @@ def generate_system_report_pdf(system_data=None):
         logger.error(f"Ошибка при создании PDF: {e}", exc_info=True)
         return None
 
-user_states = {}
-
-ssh_connections = {}
-
-BLOCKED_HOSTS = {
-    'localhost', '127.0.0.1', '::1',
-    '0.0.0.0', '0.0.0.0/0',
-    '10.0.0.0/8',
-    '172.16.0.0/12',
-    '192.168.0.0/16',
-    'fc00::/7'
-}
-
-MAX_FAILED_ATTEMPTS = 3
-LOCKOUT_TIME = 300
-failed_attempts = {}
-locked_users = {}
-
-def is_host_allowed(hostname):
-    """Проверяет, разрешен ли хост для подключения."""
-    try:
-        if not hostname or not isinstance(hostname, str):
-            return False
-            
-        if any(char in hostname for char in ';&|`$(){}[]<>\\'):
-            return False
-            
-        for blocked in BLOCKED_HOSTS:
-            if '/' in blocked:
-                continue
-            elif blocked in hostname:
-                return False
-                
-        return True
-    except Exception:
-        return False
-
-def check_rate_limit(user_id):
-    """Проверяет ограничение попыток подключения."""
-    current_time = datetime.now()
-    if user_id in locked_users:
-        if (current_time - locked_users[user_id]).total_seconds() < LOCKOUT_TIME:
-            return False
-        del locked_users[user_id]
-        failed_attempts[user_id] = 0
-        
-    return True
-
-def record_failed_attempt(user_id):
-    """Записывает неудачную попытку подключения."""
-    if user_id not in failed_attempts:
-        failed_attempts[user_id] = 1
-    else:
-        failed_attempts[user_id] += 1
-        
-    if failed_attempts[user_id] >= MAX_FAILED_ATTEMPTS:
-        locked_users[user_id] = datetime.now()
-
 @dp.message_handler(commands=["start"])
 async def start_command(message: types.Message):
     """Начальное приветствие и список команд."""
-    await message.answer(
-        "Бот активен и готов к работе.\n\n"
-        "Доступные команды:\n"
-        "/log - Получить отчет о системе\n"
-        "/ssh - Настроить SSH подключение\n"
-        "/start_monitor - Включить мониторинг системы\n"
-        "/stop_monitor - Выключить мониторинг системы"
-    )
+    await message.answer(BOT_MESSAGES['start'], parse_mode="Markdown")
 
 @dp.message_handler(commands=["ssh"])
 async def ssh_command(message: types.Message):
@@ -503,7 +436,7 @@ async def ssh_command(message: types.Message):
     
     if not check_rate_limit(user_id):
         remaining_time = int((LOCKOUT_TIME - (datetime.now() - locked_users[user_id]).total_seconds()) / 60)
-        await message.answer(f"Слишком много неудачных попыток. Попробуйте через {remaining_time} минут.")
+        await message.answer(BOT_MESSAGES['rate_limit'].format(minutes=remaining_time))
         return
     
     if message.from_user.id in ssh_connections:
@@ -512,13 +445,15 @@ async def ssh_command(message: types.Message):
         
         conn = ssh_connections[message.from_user.id]
         await message.answer(
-            f"У вас уже есть активное подключение к {conn['username']}@{conn['hostname']}\n"
-            "Для настройки нового подключения нажмите кнопку ниже.",
+            BOT_MESSAGES['ssh_exists'].format(
+                user=conn['username'],
+                host=conn['hostname']
+            ),
             reply_markup=keyboard
         )
         return
     
-    sent_msg = await message.answer("Введите SSH данные в формате user@host")
+    sent_msg = await message.answer(BOT_MESSAGES['ssh_prompt'])
     user_states[message.from_user.id] = {
         "state": "waiting_ssh",
         "message_id": sent_msg.message_id
@@ -533,7 +468,7 @@ async def cancel_ssh(callback_query: types.CallbackQuery):
         
         await callback_query.message.delete()
         
-        sent_msg = await callback_query.message.answer("Введите SSH данные в формате user@host")
+        sent_msg = await callback_query.message.answer(BOT_MESSAGES['ssh_prompt'])
         user_states[callback_query.from_user.id] = {
             "state": "waiting_ssh",
             "message_id": sent_msg.message_id
@@ -613,11 +548,11 @@ async def process_password(message: types.Message):
                 "port": 22
             }
             
-            await message.answer("✅ SSH соединение настроено!")
+            await message.answer(BOT_MESSAGES['ssh_success'])
         except Exception as ssh_error:
             record_failed_attempt(message.from_user.id)
             logger.error(f"Ошибка SSH подключения: {ssh_error}")
-            await message.answer("❌ Ошибка подключения. Проверьте данные и попробуйте снова.")
+            await message.answer(BOT_MESSAGES['ssh_error'])
     except Exception as e:
         logger.error(f"Ошибка при обработке пароля: {e}")
         await message.answer("Произошла ошибка при обработке данных")
@@ -629,14 +564,14 @@ async def log_command(message: types.Message):
     """Генерация и отправка отчета о системе."""
     try:
         if message.from_user.id not in ssh_connections:
-            await message.answer("❌ Ошибка: SSH соединение не настроено. Используйте команду /ssh для настройки подключения.")
+            await message.answer(BOT_MESSAGES['no_ssh'])
             return
 
-        wait_message = await message.answer("Генерирую отчет о системе...")
+        wait_message = await message.answer(BOT_MESSAGES['report_generating'])
 
         conn = ssh_connections[message.from_user.id]
         
-        system_data = get_system_info_ssh(
+        system_data = await get_system_info_ssh(
             conn["hostname"],
             conn.get("port", 22),
             conn["username"],
@@ -649,7 +584,7 @@ async def log_command(message: types.Message):
                 await message.answer_document(file, caption="Отчет о системе")
                 await wait_message.delete()
         else:
-            await wait_message.edit_text("Не удалось создать отчет. Проверьте логи.")
+            await wait_message.edit_text(BOT_MESSAGES['report_error'])
             logger.error("Не удалось создать отчет. Проверьте логи.")
         
         if not monitor.is_monitoring(message.from_user.id):
@@ -659,9 +594,7 @@ async def log_command(message: types.Message):
                 InlineKeyboardButton("❌ Нет", callback_data="monitor_cancel")
             )
             await message.answer(
-                "📊 Хотите включить постоянный мониторинг системы?\n\n"
-                "Я буду следить за состоянием системы и уведомлять вас "
-                "о критических ситуациях с рекомендациями по их устранению.",
+                BOT_MESSAGES['monitoring_offer'],
                 reply_markup=keyboard
             )
     except Exception as e:
@@ -677,20 +610,11 @@ async def process_monitor_callback(callback_query: types.CallbackQuery):
         if user_id in ssh_connections:
             started = await monitor.start_monitoring(user_id, ssh_connections[user_id])
             if started:
-                await callback_query.message.edit_text(
-                    "✅ Мониторинг системы включен!\n\n"
-                    "Вы будете получать уведомления о критических ситуациях.\n"
-                    "Для отключения мониторинга используйте команду /stop_monitor"
-                )
+                await callback_query.message.edit_text(BOT_MESSAGES['monitoring_enabled'])
             else:
-                await callback_query.message.edit_text(
-                    "❗ Мониторинг уже запущен"
-                )
+                await callback_query.message.edit_text(BOT_MESSAGES['monitoring_exists'])
         else:
-            await callback_query.message.edit_text(
-                "❌ Ошибка: SSH соединение не настроено.\n"
-                "Используйте команду /ssh для настройки подключения."
-            )
+            await callback_query.message.edit_text(BOT_MESSAGES['no_ssh'])
     else:
         await callback_query.message.edit_text(
             "👌 Хорошо, мониторинг не будет включен.\n"
@@ -703,26 +627,19 @@ async def start_monitor_command(message: types.Message):
     user_id = message.from_user.id
     if user_id in ssh_connections:
         if await monitor.start_monitoring(user_id, ssh_connections[user_id]):
-            await message.answer(
-                "✅ Мониторинг системы включен!\n\n"
-                "Вы будете получать уведомления о критических ситуациях.\n"
-                "Для отключения мониторинга используйте команду /stop_monitor"
-            )
+            await message.answer(BOT_MESSAGES['monitoring_enabled'])
         else:
-            await message.answer("❗ Мониторинг уже запущен")
+            await message.answer(BOT_MESSAGES['monitoring_exists'])
     else:
-        await message.answer(
-            "❌ Ошибка: SSH соединение не настроено.\n"
-            "Используйте команду /ssh для настройки подключения."
-        )
+        await message.answer(BOT_MESSAGES['no_ssh'])
 
 @dp.message_handler(commands=["stop_monitor"])
 async def stop_monitor_command(message: types.Message):
     """Команда для выключения мониторинга"""
     if await monitor.stop_monitoring(message.from_user.id):
-        await message.answer("✅ Мониторинг системы выключен")
+        await message.answer(BOT_MESSAGES['monitoring_disabled'])
     else:
-        await message.answer("❗ Мониторинг не был включен")
+        await message.answer(BOT_MESSAGES['monitoring_not_running'])
 
 if __name__ == "__main__":
     logger.info("Бот запущен")
