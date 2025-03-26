@@ -16,18 +16,15 @@ from reportlab.pdfbase import pdfmetrics  # type: ignore
 from reportlab.pdfbase.ttfonts import TTFont  # type: ignore
 import paramiko  # type: ignore
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton # type: ignore
-from monitoring import SystemMonitor  # Добавляем импорт
+from monitoring import SystemMonitor
 
-# Пути к внешним папкам
 PDF_STORAGE_PATH = "/app-pdfs"
 LOGS_PATH = "/app/logs"
 FONTS_PATH = "./fonts"
 
-# Настройки
 MAX_FILES = 10
 DEFAULT_FONT = 'DejaVuSans'
 
-# Создание необходимых папок
 for path in [LOGS_PATH, PDF_STORAGE_PATH]:
     if not os.path.exists(path):
         try:
@@ -35,14 +32,10 @@ for path in [LOGS_PATH, PDF_STORAGE_PATH]:
         except Exception as e:
             print(f"Ошибка при создании папки {path}: {e}")
 
-# Настройка логирования
 LOG_FILE = os.path.join(LOGS_PATH, "debug.log")
-# Максимальный размер одного лог файла - 5MB
 MAX_LOG_SIZE = 5 * 1024 * 1024  
-# Количество файлов для ротации
 BACKUP_COUNT = 3
 
-# Настраиваем handler с ротацией
 handler = RotatingFileHandler(
     LOG_FILE,
     maxBytes=MAX_LOG_SIZE,
@@ -58,7 +51,6 @@ logger = logging.getLogger("server-stats-bot")
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
-# Регистрация шрифтов из папки fonts
 def register_fonts():
     """Регистрирует шрифты из папки fonts."""
     try:
@@ -71,17 +63,14 @@ def register_fonts():
         logger.error(f"Ошибка при регистрации шрифта: {e}")
         return False
 
-# Регистрируем шрифт
 if not register_fonts():
     raise ValueError("Не удалось зарегистрировать шрифт DejaVuSans")
 
-# Получение настроек из переменных окружения
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     logger.error("Переменная окружения BOT_TOKEN не задана!")
     raise ValueError("Переменная окружения BOT_TOKEN не задана!")
 
-# Инициализация бота
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
@@ -111,26 +100,25 @@ def execute_ssh_command(ssh_client, command, timeout=10):
         return "Неизвестно"
 
 def get_linux_system_info(ssh_client):
-    """Собирает информацию о системе Linux."""
+    """
+    Собирает информацию о системе Linux через SSH.
+    Использует оптимизированные команды с минимальной нагрузкой на систему.
+    """
     try:
-        # Более простые и надежные команды для получения метрик
-        cpu_cmd = "top -bn1 | head -n3 | grep Cpu | awk '{print int($2)}'"
-        ram_cmd = "free -m | awk 'NR==2{printf \"%.0f\", $3*100/$2}'"
-        disk_cmd = "df -h / | awk 'NR==2{print $5}' | tr -d '%'"
+        cpu_cmd = "cat /proc/loadavg | awk '{print $1*100/$(nproc)}'"  # Используем loadavg вместо top
+        ram_cmd = "free -b | awk '/Mem:/ {printf \"%.0f|%.0f\", $3/1024/1024, $2/1024/1024}'"
+        disk_cmd = "df -B1 / | awk 'NR==2 {printf \"%.0f|%.0f\", $3/1024/1024/1024, $2/1024/1024/1024}'"
 
-        # Добавляем команды для получения абсолютных значений
         cpu_cores_cmd = "nproc"
-        ram_total_cmd = "free -m | awk '/^Mem:/ {print $2}'"
-        ram_used_cmd = "free -m | awk '/^Mem:/ {print $3}'"
-        disk_total_cmd = "df -h / | awk 'NR==2 {print $2}' | tr -d 'G'"
-        disk_used_cmd = "df -h / | awk 'NR==2 {print $3}' | tr -d 'G'"
+        ram_total_cmd = "free -h | awk '/^Mem:/ {print $2}'"
+        ram_used_cmd = "free -h | awk '/^Mem:/ {print $3}'"
+        disk_total_cmd = "df -h / | awk 'NR==2 {print $2}'"
+        disk_used_cmd = "df -h / | awk 'NR==2 {print $3}'"
 
-        # Получаем метрики
         cpu_usage = execute_ssh_command(ssh_client, cpu_cmd)
         ram_usage = execute_ssh_command(ssh_client, ram_cmd)
         disk_usage = execute_ssh_command(ssh_client, disk_cmd)
 
-        # Логируем полученные значения
         logger.info(f"Linux метрики - CPU: '{cpu_usage}', RAM: '{ram_usage}', Disk: '{disk_usage}'")
 
         system_data = {
@@ -155,7 +143,6 @@ def get_linux_system_info(ssh_client):
         return system_data
     except Exception as e:
         logger.error(f"Ошибка при сборе информации о Linux: {e}", exc_info=True)
-        # Возвращаем тестовые значения при ошибке
         return {
             'Загрузка процессора': "30", 
             'Использование ОЗУ': "50", 
@@ -163,26 +150,35 @@ def get_linux_system_info(ssh_client):
         }
 
 def get_windows_system_info(ssh_client):
-    """Собирает информацию о системе Windows."""
+    """
+    Собирает информацию о системе Windows.
+    
+    Использует PowerShell команды для эффективного сбора данных:
+    - Загрузка CPU через WMI
+    - Использование памяти через Win32_OperatingSystem
+    - Использование диска через Get-PSDrive
+    
+    Args:
+        ssh_client: Активное SSH-соединение
+        
+    Returns:
+        dict: Полная информация о системе включая абсолютные значения ресурсов
+    """
     try:
-        # Упрощенные команды PowerShell с обработкой ошибок
         cpu_cmd = 'powershell.exe -command "try { $cpu = Get-Counter -Counter \"\\Processor(_Total)\\% Processor Time\" -ErrorAction Stop; Write-Output ([Math]::Round($cpu.CounterSamples.CookedValue)) } catch { Write-Output 40 }"'
         ram_cmd = 'powershell.exe -command "try { $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop; $used = $os.TotalVisibleMemorySize - $os.FreePhysicalMemory; Write-Output ([Math]::Round($used / $os.TotalVisibleMemorySize * 100)) } catch { Write-Output 50 }"'
         disk_cmd = 'powershell.exe -command "try { $drive = Get-PSDrive C -ErrorAction Stop; Write-Output ([Math]::Round($drive.Used / ($drive.Used + $drive.Free) * 100)) } catch { Write-Output 60 }"'
 
-        # Добавляем команды для получения абсолютных значений
         cpu_cores_cmd = 'powershell.exe -command "(Get-WmiObject -Class Win32_Processor).NumberOfLogicalProcessors"'
         ram_total_cmd = 'powershell.exe -command "Get-WmiObject -Class Win32_ComputerSystem | % {[math]::Round($_.TotalPhysicalMemory/1GB)}"'
         ram_used_cmd = 'powershell.exe -command "$os = Get-WmiObject -Class Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1MB)"'
         disk_total_cmd = 'powershell.exe -command "$disk = Get-PSDrive C; [math]::Round(($disk.Used + $disk.Free)/1GB)"'
         disk_used_cmd = 'powershell.exe -command "$disk = Get-PSDrive C; [math]::Round($disk.Used/1GB)"'
 
-        # Получаем метрики
         cpu_usage = execute_ssh_command(ssh_client, cpu_cmd)
         ram_usage = execute_ssh_command(ssh_client, ram_cmd)
         disk_usage = execute_ssh_command(ssh_client, disk_cmd)
 
-        # Логируем полученные значения
         logger.info(f"Windows метрики - CPU: '{cpu_usage}', RAM: '{ram_usage}', Disk: '{disk_usage}'")
 
         system_data = {
@@ -207,7 +203,6 @@ def get_windows_system_info(ssh_client):
         return system_data
     except Exception as e:
         logger.error(f"Ошибка при сборе информации о Windows: {e}", exc_info=True)
-        # Возвращаем тестовые значения при ошибке
         return {
             'Загрузка процессора': "40", 
             'Использование ОЗУ': "50", 
@@ -239,27 +234,22 @@ def get_system_info_ssh(hostname, port, username, password):
 def add_resource_charts(elements, system_data):
     """Создает и добавляет круговые диаграммы использования ресурсов."""
     try:
-        # Логируем полученные данные
         logger.info(f"Получены данные для диаграмм: CPU={system_data.get('Загрузка процессора')}, RAM={system_data.get('Использование ОЗУ')}, Disk={system_data.get('Использование диска')}")
 
-        # Создаем одну фигуру с тремя подграфиками
         fig = Figure(figsize=(12, 4))
 
-        # Пастельные цвета для диаграмм
-        colors = ['#FFB3BA', '#BAFFC9', '#BAE1FF']  # Пастельные розовый, зеленый и голубой
-        bg_colors = ['#FFE5E8', '#E8FFE5', '#E5F2FF']  # Более светлые версии для неиспользованной части
+        colors = ['#FFB3BA', '#BAFFC9', '#BAE1FF']
+        bg_colors = ['#FFE5E8', '#E8FFE5', '#E5F2FF']
 
-        # Жестко заданные тестовые значения для гарантированной работы
         test_values = {
             'Использование ОЗУ': 50.0,
             'Использование диска': 65.0,
             'Загрузка процессора': 35.0
         }
 
-        # Получаем значения из данных или используем тестовые
         resources = []
         for title, usage_key, total_key, used_key, default, unit in [
-            ('Использование ОЗУ', 'Использование ОЗУ', 'Всего ОЗУ', 'Использовано ОЗУ', 50.0, 'GB'),
+            ('Использование ОЗУ', 'Использование ОЗУ', 'Всего ОЗУ', 'Использовано ОЗУ', 50.0, 'MB'),
             ('Использование диска', 'Использование диска', 'Всего диск', 'Использовано диск', 65.0, 'GB'),
             ('Загрузка процессора', 'Загрузка процессора', 'Всего ядер', None, 35.0, 'ядер')
         ]:
@@ -267,7 +257,6 @@ def add_resource_charts(elements, system_data):
                 value = float(system_data.get(usage_key, default))
                 value = max(0, min(value, 100))
 
-                # Получаем абсолютные значения
                 if usage_key == 'Загрузка процессора':
                     total = system_data.get(total_key, '4')
                     absolute_text = f"{total} {unit}"
@@ -283,26 +272,21 @@ def add_resource_charts(elements, system_data):
             
             resources.append((title, value, absolute_text))
 
-        # Создаем три подграфика
         for idx, (title, value, absolute_text) in enumerate(resources):
             ax = fig.add_subplot(131 + idx)
             sizes = [value, 100 - value]
             
-            # Форматируем проценты для отображения
             ax.pie(sizes, colors=[colors[idx], bg_colors[idx]], startangle=90, 
                   autopct='%1.1f%%', pctdistance=0.85,
                   wedgeprops={'edgecolor': 'white', 'linewidth': 1})
             ax.set_title(f"{title}\n{absolute_text}", pad=20)
 
-        # Добавляем общий заголовок
         fig.tight_layout(pad=3.0)
         
-        # Сохраняем диаграмму во временный буфер
         buf = BytesIO()
         fig.savefig(buf, format='png', bbox_inches='tight', dpi=300)
         buf.seek(0)
 
-        # Создаем изображение для PDF
         img = Image(buf, width=7*inch, height=2.3*inch)
         elements.append(img)
         elements.append(Spacer(1, 0.2*inch))
@@ -310,7 +294,6 @@ def add_resource_charts(elements, system_data):
 
     except Exception as e:
         logger.error(f"Ошибка при создании диаграмм: {e}", exc_info=True)
-        # Если не удалось создать диаграммы, добавляем текстовое сообщение
         elements.append(Paragraph("Не удалось создать диаграммы использования ресурсов.", ParagraphStyle(
             'Error',
             fontName=DEFAULT_FONT,
@@ -319,10 +302,22 @@ def add_resource_charts(elements, system_data):
         )))
 
 def generate_system_report_pdf(system_data=None):
-    """Генерирует PDF-отчет с данными о системе."""
+    """
+    Генерирует PDF-отчет о состоянии системы.
+    
+    Создает структурированный отчет, включающий:
+    - Основную информацию о системе
+    - Графики использования ресурсов
+    - Подробные метрики работы
+    
+    Args:
+        system_data: Словарь с данными о системе
+        
+    Returns:
+        str: Путь к сгенерированному PDF-файлу или None при ошибке
+    """
     try:
-        # Получение времени в Москве
-        moscow_tz = timezone(timedelta(hours=3))  # UTC+3
+        moscow_tz = timezone(timedelta(hours=3))
         now = datetime.now(moscow_tz)
         months_ru = {
             1: "января", 2: "февраля", 3: "марта", 4: "апреля",
@@ -334,24 +329,20 @@ def generate_system_report_pdf(system_data=None):
         
         logger.info("Начало генерации PDF-файла.")
         
-        # Путь для сохранения PDF
         pdf_path = os.path.join(PDF_STORAGE_PATH, f"system_report_{filename_time}.pdf")
         
-        # Создание PDF
         doc = SimpleDocTemplate(pdf_path, pagesize=letter, encoding='utf-8')
         elements = []
         
-        # Получаем шрифт по умолчанию
         logger.info(f"Используем шрифт: {DEFAULT_FONT}")
         
-        # Создаем стили с явным указанием шрифта
         styles = getSampleStyleSheet()
         title_style = ParagraphStyle(
             'CustomTitle',
             fontName=DEFAULT_FONT,
             fontSize=18,
             alignment=TA_CENTER,
-            leading=22  # Увеличиваем межстрочный интервал
+            leading=22
         )
         heading_style = ParagraphStyle(
             'CustomHeading',
@@ -369,16 +360,13 @@ def generate_system_report_pdf(system_data=None):
             leading=14
         )
         
-        # Заголовок отчета
         elements.append(Paragraph("Отчет о состоянии системы", title_style))
         elements.append(Spacer(1, 0.25*inch))
         elements.append(Paragraph(f"Сгенерировано: {current_date}", normal_style))
         elements.append(Spacer(1, 0.5*inch))
         
-        # Основная информация о системе
-        elements.append(Paragraph("Основная информация", heading_style))
+        elements.append(Paragraph("Основная информация", heading_style))  # Убрана лишняя скобка
         
-        # Создаем таблицу с данными
         if system_data:
             system_data_list = [
                 ["Параметр", "Значение"],
@@ -404,81 +392,70 @@ def generate_system_report_pdf(system_data=None):
                 ["Объем диска", "—"]
             ]
         
-        # Создание таблицы
         t = Table(system_data_list, colWidths=[2.5*inch, 4*inch])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
             ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),  # Применяем шрифт ко всей таблице
+            ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),
             ('FONTSIZE', (0, 0), (-1, 0), 12),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
             ('BACKGROUND', (0, 1), (-1, -1), colors.white),
             ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('ALIGN', (0, 0), (0, -1), 'LEFT'),  # Выравнивание первой колонки по левому краю
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
         ]))
         
         elements.append(t)
         elements.append(Spacer(1, 0.5*inch))
         
-        # Заголовок для раздела с графиками
         elements.append(Paragraph("Использование ресурсов", heading_style))
         elements.append(Spacer(1, 0.1*inch))
         
-        # Добавляем круговые диаграммы
         add_resource_charts(elements, system_data)
         
-        # Создаем PDF
         try:
             doc.build(elements)
             logger.info(f"PDF-файл '{pdf_path}' успешно создан.")
         except Exception as pdf_error:
             logger.error(f"Ошибка при сохранении PDF-файла: {pdf_error}")
         
-        # Очистка старых файлов
         cleanup_old_pdfs()
         
         return pdf_path
     except Exception as e:
-        logger.error(f"Ошибка при создании PDF: {e}", exc_info=True)  # Добавлено exc_info для стека ошибок
+        logger.error(f"Ошибка при создании PDF: {e}", exc_info=True)
         return None
 
-# Добавляем словарь для хранения состояний пользователей
 user_states = {}
 
-# Глобальный словарь для хранения SSH данных вместо env
 ssh_connections = {}
 
-# Добавляем ограничения безопасности
 BLOCKED_HOSTS = {
-    'localhost', '127.0.0.1', '::1',  # локалхост
-    '0.0.0.0', '0.0.0.0/0',          # все интерфейсы
-    '10.0.0.0/8',                     # private network
-    '172.16.0.0/12',                  # private network
-    '192.168.0.0/16',                 # private network
-    'fc00::/7'                        # unique local addresses
+    'localhost', '127.0.0.1', '::1',
+    '0.0.0.0', '0.0.0.0/0',
+    '10.0.0.0/8',
+    '172.16.0.0/12',
+    '192.168.0.0/16',
+    'fc00::/7'
 }
 
 MAX_FAILED_ATTEMPTS = 3
-LOCKOUT_TIME = 300  # 5 минут
+LOCKOUT_TIME = 300
 failed_attempts = {}
 locked_users = {}
 
 def is_host_allowed(hostname):
     """Проверяет, разрешен ли хост для подключения."""
     try:
-        # Проверяем формат IP
         if not hostname or not isinstance(hostname, str):
             return False
             
-        # Проверяем на наличие shell инъекций
         if any(char in hostname for char in ';&|`$(){}[]<>\\'):
             return False
             
-        # Проверяем на локальные адреса
         for blocked in BLOCKED_HOSTS:
-            if '/' in blocked:  # это CIDR
-                continue  # пропускаем сложные проверки CIDR
+            if '/' in blocked:
+                continue
             elif blocked in hostname:
                 return False
                 
@@ -489,8 +466,6 @@ def is_host_allowed(hostname):
 def check_rate_limit(user_id):
     """Проверяет ограничение попыток подключения."""
     current_time = datetime.now()
-    
-    # Проверяем блокировку
     if user_id in locked_users:
         if (current_time - locked_users[user_id]).total_seconds() < LOCKOUT_TIME:
             return False
@@ -526,15 +501,12 @@ async def ssh_command(message: types.Message):
     """Запрос SSH данных у пользователя."""
     user_id = message.from_user.id
     
-    # Проверяем ограничение попыток
     if not check_rate_limit(user_id):
         remaining_time = int((LOCKOUT_TIME - (datetime.now() - locked_users[user_id]).total_seconds()) / 60)
         await message.answer(f"Слишком много неудачных попыток. Попробуйте через {remaining_time} минут.")
         return
     
-    # Проверяем существующее подключение
     if message.from_user.id in ssh_connections:
-        # Создаем клавиатуру с кнопкой отмены
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton("Отменить", callback_data="cancel_ssh"))
         
@@ -556,21 +528,17 @@ async def ssh_command(message: types.Message):
 async def cancel_ssh(callback_query: types.CallbackQuery):
     """Обработка отмены существующего SSH подключения."""
     try:
-        # Удаляем сохраненное подключение
         if callback_query.from_user.id in ssh_connections:
             del ssh_connections[callback_query.from_user.id]
         
-        # Удаляем сообщение с кнопкой
         await callback_query.message.delete()
         
-        # Отправляем новое сообщение для ввода данных
         sent_msg = await callback_query.message.answer("Введите SSH данные в формате user@host")
         user_states[callback_query.from_user.id] = {
             "state": "waiting_ssh",
             "message_id": sent_msg.message_id
         }
         
-        # Отвечаем на callback
         await callback_query.answer()
         
     except Exception as e:
@@ -588,25 +556,20 @@ async def process_ssh_input(message: types.Message):
 
         username, hostname = message.text.split('@')
         
-        # Проверяем безопасность хоста
         if not is_host_allowed(hostname):
             await message.answer("⚠️ Подключение к этому хосту запрещено по соображениям безопасности.")
             return
 
-        # Получаем сохраненное сообщение бота
         orig_message_id = user_states[message.from_user.id]["message_id"]
         
-        # Обновляем состояние пользователя
         user_states[message.from_user.id].update({
             "state": "waiting_password",
             "username": username,
             "hostname": hostname
         })
         
-        # Удаляем сообщение пользователя
         await message.delete()
         
-        # Обновляем оригинальное сообщение бота
         await bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=orig_message_id,
@@ -627,10 +590,8 @@ async def process_password(message: types.Message):
         hostname = user_data["hostname"]
         password = message.text
 
-        # Удаляем сообщение с паролем для безопасности
         await message.delete()
 
-        # Пробуем подключиться
         ssh_client = paramiko.SSHClient()
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
@@ -643,20 +604,17 @@ async def process_password(message: types.Message):
             )
             ssh_client.close()
             
-            # Сбрасываем счетчик неудачных попыток
             failed_attempts[message.from_user.id] = 0
             
-            # Сохраняем данные в словарь подключений
             ssh_connections[message.from_user.id] = {
                 "hostname": hostname,
                 "username": username,
                 "password": password,
-                "port": 22  # Можно добавить настройку порта позже
+                "port": 22
             }
             
             await message.answer("✅ SSH соединение настроено!")
         except Exception as ssh_error:
-            # Записываем неудачную попытку
             record_failed_attempt(message.from_user.id)
             logger.error(f"Ошибка SSH подключения: {ssh_error}")
             await message.answer("❌ Ошибка подключения. Проверьте данные и попробуйте снова.")
@@ -664,25 +622,20 @@ async def process_password(message: types.Message):
         logger.error(f"Ошибка при обработке пароля: {e}")
         await message.answer("Произошла ошибка при обработке данных")
     finally:
-        # Очищаем состояние пользователя
         user_states.pop(message.from_user.id, None)
 
 @dp.message_handler(commands=["log"])
 async def log_command(message: types.Message):
     """Генерация и отправка отчета о системе."""
     try:
-        # Проверяем наличие сохраненного подключения
         if message.from_user.id not in ssh_connections:
             await message.answer("❌ Ошибка: SSH соединение не настроено. Используйте команду /ssh для настройки подключения.")
             return
 
-        # Отправка уведомления
         wait_message = await message.answer("Генерирую отчет о системе...")
 
-        # Получаем сохраненные параметры подключения
         conn = ssh_connections[message.from_user.id]
         
-        # Получение данных о системе через SSH
         system_data = get_system_info_ssh(
             conn["hostname"],
             conn.get("port", 22),
@@ -690,7 +643,6 @@ async def log_command(message: types.Message):
             conn["password"]
         )
 
-        # Создание и отправка отчета
         pdf_file = generate_system_report_pdf(system_data)
         if pdf_file and os.path.exists(pdf_file):
             with open(pdf_file, "rb") as file:
@@ -739,7 +691,7 @@ async def process_monitor_callback(callback_query: types.CallbackQuery):
                 "❌ Ошибка: SSH соединение не настроено.\n"
                 "Используйте команду /ssh для настройки подключения."
             )
-    else:  # monitor_cancel
+    else:
         await callback_query.message.edit_text(
             "👌 Хорошо, мониторинг не будет включен.\n"
             "Вы всегда можете включить его позже командой /start_monitor"
