@@ -44,25 +44,27 @@ ENV LANG=ru_RU.UTF-8 \
 # Копирование установленных пакетов из этапа сборки
 COPY --from=builder /root/.local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 
-# Создание и настройка директорий
-RUN mkdir -p /app/fonts /app-pdfs /app/logs \
-    && chmod -R 777 /app-pdfs /app/logs
+# Создание пользователя с ограниченными правами
+RUN useradd -m -r -s /bin/bash botuser
+
+# Создание и настройка директорий с правильными правами
+RUN mkdir -p /app/fonts /app/logs /app-pdfs \
+    && chown -R botuser:botuser /app /app-pdfs \
+    && chmod -R 755 /app \
+    && chmod -R 777 /app/logs /app-pdfs
 
 # Копирование шрифтов и обновление кэша
 COPY fonts/ /app/fonts/
 RUN mkdir -p /usr/local/share/fonts/custom \
     && cp -r /app/fonts/*.ttf /usr/local/share/fonts/custom/ \
-    && fc-cache -fv
+    && fc-cache -fv \
+    && chown -R botuser:botuser /app/fonts
 
 # Копирование исходного кода
-COPY . .
+COPY --chown=botuser:botuser . .
 
 # Проверка наличия необходимых файлов и настройка matplotlib для работы без GUI
-RUN python -c "import matplotlib; matplotlib.use('Agg'); import reportlab"
-
-# Пользователь с ограниченными правами
-RUN useradd -m -r -s /bin/bash botuser \
-    && chown -R botuser:botuser /app /app-pdfs /app/logs
 USER botuser
+RUN python -c "import matplotlib; matplotlib.use('Agg'); import reportlab"
 
 CMD ["python", "main.py"]

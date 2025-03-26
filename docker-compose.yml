@@ -16,8 +16,9 @@ services:
     volumes:
       - ./pdf-storage:/app-pdfs:rw
       - ./logs:/app/logs:rw
-    tmpfs:
-      - /tmp
+      - type: tmpfs
+        target: /tmp
+    user: "${UID:-1000}:${GID:-1000}"
     deploy:
       resources:
         limits:
