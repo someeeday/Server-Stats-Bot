@@ -263,29 +263,59 @@ async def get_system_info_ssh(hostname: str, port: int, username: str, password:
 def add_resource_charts(elements: list, system_data: dict):
     """Создание графиков использования ресурсов."""
     try:
+        # Извлекаем и нормализуем значения из system_data
+        def extract_value(value_str):
+            try:
+                if isinstance(value_str, (int, float)):
+                    return float(value_str)
+                if isinstance(value_str, str):
+                    # Извлекаем первое число из строки
+                    import re
+                    numbers = re.findall(r'[\d.]+', value_str)
+                    return float(numbers[0]) if numbers else 0.0
+                return 0.0
+            except (ValueError, IndexError):
+                return 0.0
+
         resources = [
-            ('Загрузка процессора', float(system_data.get('Загрузка процессора', 0))),
-            ('Использование ОЗУ', float(system_data.get('Использование ОЗУ', 0))),
-            ('Использование диска', float(system_data.get('Использование диска', 0)))
+            ('Загрузка процессора', extract_value(system_data.get('Загрузка процессора'))),
+            ('Использование ОЗУ', extract_value(system_data.get('Использование ОЗУ'))),
+            ('Использование диска', extract_value(system_data.get('Использование диска')))
         ]
 
+        # Создаем фигуру для графиков
         fig = Figure(figsize=(12, 4))
         colors = ['#FFB3BA', '#BAFFC9', '#BAE1FF']
         bg_colors = ['#FFE5E8', '#E8FFE5', '#E5F2FF']
 
         for idx, (title, value) in enumerate(resources):
-            value = max(0, min(value, 100))  # Нормализация значений
+            value = max(0.0, min(100.0, value))  # Нормализация значений
             ax = fig.add_subplot(131 + idx)
             sizes = [value, 100 - value]
             
-            ax.pie(sizes, colors=[colors[idx], bg_colors[idx]], 
-                  startangle=90, autopct='%1.1f%%',
-                  pctdistance=0.85,
-                  wedgeprops={'edgecolor': 'white', 'linewidth': 1})
+            # Добавляем проверку на нулевые значения
+            if value == 0 and sizes[1] == 100:
+                sizes = [0.01, 99.99]  # Минимальное значение для отображения
+
+            wedges, texts, autotexts = ax.pie(
+                sizes, 
+                colors=[colors[idx], bg_colors[idx]], 
+                startangle=90, 
+                autopct='%1.1f%%',
+                pctdistance=0.85,
+                wedgeprops={'edgecolor': 'white', 'linewidth': 1}
+            )
+            
+            # Настройка внешнего вида текста процентов
+            for autotext in autotexts:
+                autotext.set_color('black')
+                autotext.set_fontsize(9)
+            
             ax.set_title(title, pad=20)
 
         fig.tight_layout(pad=3.0)
         
+        # Сохраняем график с высоким разрешением
         buf = BytesIO()
         fig.savefig(buf, format='png', bbox_inches='tight', dpi=300)
         buf.seek(0)
